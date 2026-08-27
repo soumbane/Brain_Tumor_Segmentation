@@ -61,6 +61,35 @@ CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS PYPI_EAI
 GRANT USAGE ON INTEGRATION PYPI_EAI TO ROLE BRATS_ML_ROLE;
 
 -- ---------------------------------------------------------------------
+-- 3b. OPTIONAL: Weights & Biases live logging.
+--
+--     Only needed for `--wandb-mode online`. The default is OFFLINE, which
+--     writes run data to the container's local disk and requires no network
+--     at all -- curves are viewed later via `wandb sync`. Skip this whole
+--     section if egress to a third-party SaaS is not acceptable.
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE NETWORK RULE WANDB_NR
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('api.wandb.ai');
+
+CREATE EXTERNAL ACCESS INTEGRATION IF NOT EXISTS WANDB_EAI
+  ALLOWED_NETWORK_RULES = (WANDB_NR)
+  ENABLED = TRUE
+  COMMENT = 'Weights & Biases live experiment tracking';
+
+GRANT USAGE ON INTEGRATION WANDB_EAI TO ROLE BRATS_ML_ROLE;
+
+-- The API key is passed as a SECRET so it never appears in job arguments,
+-- the payload, or the query history.
+CREATE SECRET IF NOT EXISTS BRATS_MRI.CORE.WANDB_API_KEY
+  TYPE = GENERIC_STRING
+  SECRET_STRING = '<paste-the-wandb-api-key>'
+  COMMENT = 'W&B API key for ML Jobs (online tracking only)';
+
+GRANT USAGE ON SECRET BRATS_MRI.CORE.WANDB_API_KEY TO ROLE BRATS_ML_ROLE;
+
+-- ---------------------------------------------------------------------
 -- 4. Project database, schema, and stages
 --
 --    Data volume: 32.9 GB labeled (2350 cases) + 5.7 GB unlabeled

@@ -26,7 +26,7 @@ torch = [
     "torch>=2.4",
     "monai>=1.4",
     "einops",
-    "tensorboard",
+    "wandb>=0.17",
 ]
 snowflake = [
     "snowflake-ml-python>=1.26.0",

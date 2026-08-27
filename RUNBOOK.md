@@ -23,10 +23,13 @@ uv python install 3.12
 uv venv --python 3.12
 uv pip install -e .
 
-# Local CPU torch + MONAI, for authoring and CPU smoke tests only.
+# Local CPU torch + MONAI + wandb, for authoring and CPU smoke tests only.
 # All real training happens on SPCS.
 uv pip install -e ".[torch]" --index-strategy unsafe-best-match `
   --extra-index-url https://download.pytorch.org/whl/cpu
+
+# W&B: log in once for online mode. Offline mode needs no login.
+wandb login
 
 # Official lesion-wise metric: git clone only, there is no pip package.
 git clone https://github.com/rachitsaluja/BraTS-2023-Metrics.git external/brats_metrics
@@ -153,6 +156,26 @@ service and Snowflake will not restart it.
 
 **Gate (full).** GLI average lesion-wise Dice ≥ 0.78 on validation.
 
+### Experiment tracking (Weights & Biases)
+
+Enabled in `configs/segresnet_base.yaml` (`wandb: true`), **offline by default**.
+Offline needs no network at all: run data lands in `runs/wandb/` for a later sync.
+
+```powershell
+# Live curves instead. Needs WANDB_EAI + the API-key secret from admin_grants.sql.
+.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 150 `
+  --wandb-mode online --wandb-secret BRATS_MRI.CORE.WANDB_API_KEY
+
+# Or retrieve an offline run afterwards and sync it locally.
+wandb sync runs\wandb\offline-run-*
+```
+
+Only rank 0 logs, so the four ranks cannot interleave into one unusable curve.
+Ablation arms are auto-tagged (`ablation-seg-only`, `ablation-gap-confound`,
+`uncertainty-weighting`) — use `--wandb-group` to compare them side by side. Every
+tracker call is failure-tolerant: a network blip or an expired key degrades to a
+no-op rather than killing a job that has been burning A10G credits for hours.
+
 Local single-GPU or CPU debugging of the same code path:
 
 ```powershell
@@ -223,14 +246,14 @@ number** — n≈10 there, and differences under 0.05 Dice are noise.
 
 | Step | State |
 |---|---|
-| 0. Environment | **done** — uv, Python 3.12.14, venv, core deps, CPU torch 2.13 + MONAI |
-| 0. `external/brats_metrics` clone | not done |
+| 0. Environment | **done** — uv, Python 3.12.14, venv, core deps, CPU torch 2.13 + MONAI 1.6.0, wandb 0.29 |
+| 0. `external/brats_metrics` clone | **not done** — needed before reporting any number |
 | 0. Snowflake grants | **blocked** — needs `ACCOUNTADMIN` to run `scripts/admin_grants.sql` |
 | 1a. Extract | **done** — 2755 cases: GLI 1251/219, MEN 1000/141, PED 99/45, all counts exact |
-| 1b. Manifest | **not run to completion.** Partial run showed labels `0,1,2,3` with no 4s on GLI |
-| 1c. Splits | not run |
-| 2. Confound pre-screen | not run |
-| 3. Preprocess | not run |
+| 1b. Manifest | **done, PASSED** — 0 label-4s, labels exactly {0,1,2,3}, 0 integrity errors |
+| 1c. Splits | **done, committed** — `splits/split_random_seed42.csv`, 0 patient leakage |
+| 2. Confound pre-screen | **done** — mask geometry alone reaches 0.769 balanced acc (chance 0.333) |
+| 3. Preprocess cache | **NOT RUN** — required before training can start |
 | 4–9 | not run (4+ blocked on grants) |
 
-All scripts are written and ready. Resume at step **1b**.
+All scripts are written and statically verified. Resume at step **3**.

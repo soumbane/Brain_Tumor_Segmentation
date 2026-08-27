@@ -61,6 +61,7 @@ from brats.data.transforms import (
 from brats.losses import build_loss
 from brats.metrics.lesionwise import legacy_dice
 from brats.models.multitask import MultiTaskConfig, build_model, count_parameters
+from brats.tracking import build_logger
 
 log = logging.getLogger("brats.train")
 
@@ -108,6 +109,19 @@ class TrainConfig:
     #: Snowflake stage to mirror checkpoints to, e.g. "@BRATS_MRI.CORE.CKPT".
     #: Empty disables staging (local runs).
     stage_uri: str = ""
+
+    # -- experiment tracking (Weights & Biases) ---------------------------
+    wandb: bool = False
+    wandb_project: str = "brats2023"
+    wandb_entity: str = ""
+    wandb_group: str = ""
+    #: "offline" is the safe default in an SPCS container: online mode needs egress
+    #: to api.wandb.ai via an external access integration. Offline writes to disk for
+    #: a later `wandb sync`.
+    wandb_mode: str = "offline"
+    #: Log gradient histograms. Off by default: real overhead on a 20M-param 3D CNN
+    #: for information that rarely changes a decision.
+    wandb_watch: bool = False
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -294,6 +308,7 @@ class CheckpointManager:
         scheduler: Any,
         loss_module: nn.Module,
         metrics: dict[str, float],
+        tracker: Any = None,
     ) -> None:
         net = model.module if isinstance(model, DDP) else model
         state = {
@@ -330,6 +345,9 @@ class CheckpointManager:
                 shutil.copyfile(last, dest)
                 self._stage(dest)
                 log.info("new best %s: %.4f (epoch %d)", key, value, epoch)
+                if tracker is not None:
+                    tracker.summary(f"best_dice_{key}", float(value))
+                    tracker.summary(f"best_dice_{key}_epoch", epoch)
 
         (self.dir / "metrics.jsonl").open("a", encoding="utf-8").write(
             json.dumps({"epoch": epoch, **metrics}) + "\n"
@@ -513,6 +531,25 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
     ckpt = CheckpointManager(cfg)
     start_epoch = ckpt.load(model, optimizer, scheduler, loss_module) if resume else 0
 
+    # Rank-zero only. A disabled tracker is a silent no-op, and no tracker failure can
+    # kill the run -- see brats.tracking.
+    tracker = build_logger(cfg, is_rank_zero=is_main(rank))
+    if tracker.enabled:
+        total, trainable = count_parameters(model.module if isinstance(model, DDP) else model)
+        tracker.log_config_update(
+            {
+                "world_size": world_size,
+                "effective_batch": cfg.batch_size_per_gpu * world_size,
+                "params_total_m": round(total / 1e6, 2),
+                "steps_per_epoch": len(train_loader),
+                "train_cases": len(train_loader.dataset),
+                "val_cases": len(val_loader.dataset),
+                "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            }
+        )
+        if cfg.wandb_watch:
+            tracker.watch(model)
+
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16
     # bf16 needs no GradScaler; fp16 does. Prefer bf16 -- see brats.losses.
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
@@ -527,6 +564,7 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
         t0 = time.time()
         running = {"total": 0.0, "seg": 0.0, "cls": 0.0}
         n_steps = 0
+        global_step = epoch * len(train_loader)
 
         for batch in train_loader:
             image = batch["image"].to(device, non_blocking=True)
@@ -559,6 +597,22 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
                 running[k] += float(losses[k].detach())
             n_steps += 1
 
+            # Per-step logging on rank 0. Every 20 steps keeps the curve readable
+            # without flooding the run; LR matters because batch 8 is off-literature
+            # and the schedule is being swept.
+            if is_main(rank) and tracker.enabled and n_steps % 20 == 0:
+                tracker.log(
+                    {
+                        "train/loss": float(losses["total"].detach()),
+                        "train/loss_seg": float(losses["seg"]),
+                        "train/loss_cls": float(losses["cls"]),
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/warmup_alpha": alpha,
+                        "epoch": epoch + 1,
+                    },
+                    step=global_step + n_steps,
+                )
+
         for k in running:
             running[k] = all_reduce_mean(running[k] / max(n_steps, 1), device)
 
@@ -580,9 +634,31 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
                 metrics["dice_WT"], metrics["cls_acc"],
             )
         if is_main(rank):
-            ckpt.save(epoch, model, optimizer, scheduler, loss_module, metrics)
+            ckpt.save(
+                epoch, model, optimizer, scheduler, loss_module, metrics, tracker=tracker
+            )
+            if tracker.enabled:
+                payload = {
+                    "epoch": epoch + 1,
+                    "epoch/loss": running["total"],
+                    "epoch/loss_seg": running["seg"],
+                    "epoch/loss_cls": running["cls"],
+                    "epoch/lr": scheduler.get_last_lr()[0],
+                    "epoch/warmup_alpha": alpha,
+                    "epoch/seconds": time.time() - t0,
+                }
+                for key in ("dice_avg", "dice_ET", "dice_TC", "dice_WT", "cls_acc"):
+                    if key in metrics:
+                        payload[f"val/{key}"] = metrics[key]
+                if loss_module.uncertainty is not None:
+                    w = loss_module.uncertainty.weights()
+                    payload["loss_weight/seg"] = w[0]
+                    payload["loss_weight/cls"] = w[1]
+                tracker.log(payload, step=(epoch + 1) * len(train_loader))
         barrier()
 
+    if is_main(rank):
+        tracker.finish()
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -603,6 +679,17 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Snowflake stage for per-epoch checkpoints, e.g. @BRATS_MRI.CORE.CKPT",
     )
+    ap.add_argument("--wandb", action="store_true", help="enable W&B tracking")
+    ap.add_argument("--no-wandb", action="store_true", help="disable W&B tracking")
+    ap.add_argument(
+        "--wandb-mode",
+        default=None,
+        choices=["online", "offline", "disabled"],
+        help="offline (default) writes to disk for a later `wandb sync`; online needs "
+        "egress to api.wandb.ai via an external access integration",
+    )
+    ap.add_argument("--wandb-project", default=None)
+    ap.add_argument("--wandb-group", default=None, help="group ablation arms together")
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -617,6 +704,16 @@ def main(argv: list[str] | None = None) -> int:
         cfg.run_name = args.run_name
     if args.stage_uri is not None:
         cfg.stage_uri = args.stage_uri
+    if args.wandb:
+        cfg.wandb = True
+    if args.no_wandb:
+        cfg.wandb = False
+    if args.wandb_mode:
+        cfg.wandb_mode = args.wandb_mode
+    if args.wandb_project:
+        cfg.wandb_project = args.wandb_project
+    if args.wandb_group:
+        cfg.wandb_group = args.wandb_group
 
     data_cfg = DataConfig.load(args.data_config) if args.data_config else DataConfig.load()
     train(cfg, data_cfg, resume=args.resume)

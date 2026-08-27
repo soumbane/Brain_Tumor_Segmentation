@@ -45,3 +45,14 @@ train:
   # running job and Snowflake will not restart it, so this is the resumability
   # guarantee, not an optimization. Empty = local run, no staging.
   stage_uri: ''                 # e.g. '@BRATS_MRI.CORE.CKPT'
+
+  # -- experiment tracking (Weights & Biases) --------------------------------
+  wandb: true
+  wandb_project: brats2023
+  wandb_entity: ''              # your W&B team/username; blank = default
+  wandb_group: ''               # set to group ablation arms, e.g. 'lambda-sweep'
+  # 'offline' is the safe default inside an SPCS container: 'online' needs egress to
+  # api.wandb.ai via an external access integration (see scripts/admin_grants.sql).
+  # Offline writes to runs/wandb/ for a later `wandb sync`.
+  wandb_mode: offline
+  wandb_watch: false            # gradient histograms; real cost on a 20M-param 3D CNN
