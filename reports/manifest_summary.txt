@@ -1,0 +1,45 @@
+========================================================================
+BraTS 2023 manifest summary
+========================================================================
+
+-- Case counts ------------------------------------------------
+split_source  train  val
+cohort                  
+GLI            1251  219
+MEN            1000  141
+PED              99   45
+
+-- Label values (the label-3-vs-4 check) ----------------------
+cases containing label 4 : 0   (MUST be 0)
+cases with labels outside {0,1,2,3} : 0
+union of observed label values : ['0', '1', '2', '3']
+
+-- Geometry ---------------------------------------------------
+shape == 240x240x155      : 2755/2755
+shape consistent per case : 2755/2755
+affine consistent per case: 2755/2755
+
+-- Empty regions per cohort (informational, expect many in PED)
+           n  empty_ET  empty_ED  empty_TC  pct_empty_ET
+cohort                                                  
+GLI     1251        33         1         6           2.6
+MEN     1000         1       464         0           0.1
+PED       99        11        42         0          11.1
+
+-- PED ET/WT volume ratio (drives the ET gating rule) --------
+n=99  median=0.1129  frac below 0.04 = 0.354
+
+-- Tumor touching brain-mask edge (NOT errors) ----------------
+           n  touching   pct
+cohort                      
+GLI     1251       868  69.4
+MEN     1000       908  90.8
+PED       99        71  71.7
+
+-- Timepoints per patient (drives grouped splitting) ---------
+patients with >1 timepoint: 134 of 2176
+  max timepoints for one patient: 8
+  -> splits MUST be grouped by patient_id (config already does)
+
+-- Integrity errors ------------------------------------------
+cases with errors: 0/2755

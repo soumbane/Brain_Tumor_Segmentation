@@ -20,6 +20,10 @@ external/brats_metrics/
 # Reports / artifacts are regenerated
 reports/*.png
 reports/*.html
+reports/*.log
+reports/*.err
+# Large regenerable feature table (191 features x N cases)
+reports/confound_features.csv
 
 # Local tooling
 .snowflake/
