@@ -1,0 +1,26 @@
+# Environments
+.venv/
+__pycache__/
+*.py[cod]
+
+# Never commit data or derived caches. Extraction target is C:\data\brats2023,
+# outside this repo, but guard against accidental copies landing here.
+data/
+*.nii
+*.nii.gz
+cache/
+runs/
+checkpoints/
+*.pt
+*.pth
+
+# Cloned, not vendored
+external/brats_metrics/
+
+# Reports / artifacts are regenerated
+reports/*.png
+reports/*.html
+
+# Local tooling
+.snowflake/
+.ipynb_checkpoints/

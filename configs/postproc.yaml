@@ -1,0 +1,66 @@
+# Post-processing thresholds -- the highest-leverage artifact in the project.
+#
+# On identical predictions, BiomedMBZ's ablation moved legacy Dice +0.34 and
+# lesion-wise Dice +9.97. Architecture choice among top backbones is worth ~+-0.01.
+#
+# Values below are the published reference points, to be RE-TUNED on our own
+# validation split. Two traps:
+#   * Validation needs LARGER thresholds than training folds (Ferreira). Never tune
+#     on training-fold predictions and ship.
+#   * Tune to the BraTS RANK, not to mean Dice (see brats/metrics/ranking.py).
+#     Ferreira's best-mean-Dice threshold (WT 1450) was judged too risky; they
+#     shipped WT 250.
+
+postprocess:
+  # 1. Per-channel probability thresholds. Not 0.5 everywhere -- BiomedMBZ's final
+  #    values. ET is lower because ET is systematically under-predicted at 0.5.
+  thresholds:
+    ET: 0.40
+    TC: 0.50
+    WT: 0.50
+
+  # 2. Joint size + mean-confidence connected-component filter. The big one.
+  #    Keep a component if:
+  #      (size >= s_upper AND conf >= p_upper)
+  #      OR (s_lower <= size < s_upper AND conf >= p_mid)
+  #    Size AND confidence beats size alone: a size-only cutoff discards
+  #    small-but-confident true lesions, which the lesion-wise metric values as
+  #    highly as large ones.
+  use_joint_filter: true
+  joint_filter:
+    WT: { s_upper: 2000, s_lower: 100, p_upper: 0.850, p_mid: 0.925 }
+    ET: { s_upper: 95,   s_lower: 70,  p_upper: 0.710, p_mid: 0.500 }
+    TC: { s_upper: 350,  s_lower: 350, p_upper: 0.0,   p_mid: 0.0 }  # size-only
+
+  # 3. Baseline alternative to (2): plain per-region minimum component size.
+  #    Ferreira shipped WT 250 / TC 150 / ET 100; CNMC used 130 (PED) / 110 (MEN).
+  min_size:
+    ET: 100
+    TC: 150
+    WT: 250
+
+  # 4. PED ET volume-ratio gate. If ET/WT < ratio, erase ET (relabel to
+  #    non-enhancing core). Took PED validation ET lesion-wise Dice 0.466 -> 0.733
+  #    and ET HD95 158.89 -> 75.93: the largest single improvement in the BraTS 2023
+  #    literature. NON-OPTIONAL for PED.
+  #
+  #    Not a hack: many PED cases (diffuse midline glioma) genuinely do not enhance,
+  #    and under the lesion-wise metric correctly predicting nothing scores 1.0 while
+  #    hallucinating a small blob scores 0.
+  apply_ped_et_gate: true
+  ped_et_wt_ratio: 0.04
+
+  # 5. Enforce ET subset of TC subset of WT. Independent sigmoid channels can violate
+  #    the nesting that is definitional for these regions.
+  enforce_nesting: true
+  connectivity: 26
+
+# Test-time augmentation. SWEEP, do not assume: BiomedMBZ gained +3.17 LW Dice from
+# 8-flip TTA, while Ferreira found DISABLING nnU-Net's TTA gave better validation and
+# was ~8x faster, letting them ensemble more models instead.
+inference:
+  roi_size: [128, 128, 128]
+  overlap: 0.5
+  mode: gaussian
+  sw_batch_size: 4
+  tta: none                     # none | eight_flip

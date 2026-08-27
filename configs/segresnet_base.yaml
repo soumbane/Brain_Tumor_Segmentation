@@ -1,0 +1,47 @@
+# Baseline recipe: SegResNetDS multi-task, GPU_NV_M (4x A10G 24GB).
+#
+# Synthesized from the BraTS 2023 winners and adapted to 24 GB per GPU.
+# Batch 2/GPU x 4 ranks = effective batch 8.
+#
+# WARNING on learning rate: every published BraTS recipe used batch 1-5 under
+# 16-48 GB VRAM limits. Nobody tuned these LR/schedule values at batch 8, so LR is
+# an early sweep target, not a settled value.
+
+train:
+  run_name: segresnet_base
+
+  # -- geometry / throughput ------------------------------------------------
+  patch_size: [128, 128, 128]   # CNMC (PED), BiomedMBZ
+  batch_size_per_gpu: 2         # 4 ranks -> effective 8
+  num_workers: 8                # 44 vCPU / 4 ranks ~= 11; augmentation is CPU-bound
+  amp_dtype: bfloat16           # A10G is Ampere; bf16 needs no GradScaler
+
+  # -- schedule -------------------------------------------------------------
+  epochs: 150                   # 50 smoke -> 150 dev -> 600 final
+  warmup_epochs: 8              # NVAUTO; then cosine anneal to zero
+  lr: 2.0e-4                    # AdamW, NVAUTO/SegResNet lineage. SWEEP THIS.
+  weight_decay: 1.0e-5
+  optimizer: adamw              # alt: sgd (nnU-Net lineage, lr 0.01 mom 0.99)
+  momentum: 0.99
+  grad_clip: 12.0
+
+  # -- loss -----------------------------------------------------------------
+  seg_loss: dice_ce             # alt: dice_focal (NVAUTO, BiomedMBZ)
+  batch_dice: true              # winners used batch dice; stabilizes empty-ET cases
+  lambda_cls: 0.1               # sweep {0.05, 0.1, 0.3, 1.0}; 0.0 = required ablation
+  loss_weighting: fixed         # alt: uncertainty (Kendall/Gal/Cipolla, GMMAS)
+
+  # -- classification head --------------------------------------------------
+  pooling: tumor_attention      # alt: gap (confound ablation), tafe (upgrade)
+  cls_warmup_epochs: 20         # GT-mask teacher forcing, annealed to prediction
+  cohort_balanced_sampling: true
+
+  # -- validation / checkpointing -------------------------------------------
+  val_every: 5
+  val_max_cases: 60             # stratified subset, for speed
+  seed: 42
+  ckpt_dir: checkpoints
+  # Mirror every epoch's checkpoint here. SPCS maintenance windows can cancel a
+  # running job and Snowflake will not restart it, so this is the resumability
+  # guarantee, not an optimization. Empty = local run, no staging.
+  stage_uri: ''                 # e.g. '@BRATS_MRI.CORE.CKPT'

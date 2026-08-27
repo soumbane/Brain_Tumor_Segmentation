@@ -1,0 +1,60 @@
+# Data layout and paths.
+#
+# The dataset and this repository both live under "OneDrive - Corewell Health".
+# Extraction MUST target a non-synced path, otherwise OneDrive will try to sync
+# ~38 GB of NIfTI files and thrash the workstation.
+
+paths:
+  # Source archives (read-only, as delivered).
+  archive_root: 'C:\Users\SOU66793\OneDrive - Corewell Health\Desktop\Datasets\BraTS_2023'
+  # Extraction target. Deliberately outside OneDrive. 309 GB free on C: as of setup.
+  extract_root: 'C:\data\brats2023'
+  # Derived artifacts that are cheap to regenerate.
+  manifest_dir: 'C:\data\brats2023\_manifest'
+  # Preprocessed uint8 cache (~52 GB). Kept on local disk, outside OneDrive: a cache
+  # this size inside the synced tree would be uploaded to corporate cloud storage,
+  # and active sync can lock files mid-write.
+  cache_root: 'C:\data\brats2023\_cache'
+  reports_dir: 'reports'
+
+# Archive filenames per cohort. `train` has seg.nii.gz; `val` does not.
+archives:
+  GLI:
+    train: 'BraTS-GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-TrainingData.zip'
+    val: 'BraTS-GLI/ASNR-MICCAI-BraTS2023-GLI-Challenge-ValidationData.zip'
+  MEN:
+    train: 'BraTS-MEN/ASNR-MICCAI-BraTS2023-MEN-Challenge-TrainingData.zip'
+    val: 'BraTS-MEN/ASNR-MICCAI-BraTS2023-MEN-Challenge-ValidationData.zip'
+  PED:
+    train: 'BraTS-PED/ASNR-MICCAI-BraTS2023-PED-Challenge-TrainingData.zip'
+    val: 'BraTS-PED/ASNR-MICCAI-BraTS2023-PED-Challenge-ValidationData.zip'
+
+# Ancillary metadata (used for leakage control and the confound analysis).
+ancillary:
+  gli_2017_mapping: 'BraTS-GLI/BraTS2023_2017_GLI_Mapping.xlsx'
+  men_clinical: 'BraTS-MEN/Meningioma supplementary clinical data and imaging parameters for training and validation sets.xlsx'
+
+# Preprocessing. Deliberately minimal, matching what every BraTS 2023 top team did.
+preprocess:
+  # Margin in voxels added around the nonzero brain bounding box.
+  crop_margin: 8
+  # Round cropped dims up to a multiple of this, so sliding-window inference and
+  # the encoder's 5 downsampling levels never hit a ragged edge.
+  size_divisor: 16
+  # No resampling: data is already 1 mm isotropic in SRI24 space.
+  resample: false
+  # No N4 bias correction or skull stripping: already done by the FeTS pipeline.
+  n4_bias_correction: false
+  skull_strip: false
+
+# Splits. Generated once, committed, never regenerated.
+splits:
+  seed: 42
+  train_frac: 0.80
+  val_frac: 0.10
+  test_frac: 0.10
+  # Stratify by cohort so all three appear in all three splits.
+  stratify_by: cohort
+  # Group by patient so multiple timepoints of one patient never straddle splits.
+  group_by: patient_id
+  output: 'splits/split_random_seed42.csv'
