@@ -474,7 +474,22 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
     if world_size > 1:
         # SyncBatchNorm: with batch 2/GPU, per-rank BN statistics are too noisy.
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        # When lambda_cls == 0 the classification head still runs in forward (so its
+        # loss stays reportable and the ablation stays comparable) but receives no
+        # gradient. DDP rejects unused parameters by default and fails on the SECOND
+        # iteration with "Expected to have finished reduction in the prior iteration".
+        # Verified: 7 params (classifier + pooling temperature) go grad-less.
+        needs_unused = cfg.lambda_cls == 0.0 and cfg.loss_weighting != "uncertainty"
+        if needs_unused and is_main(rank):
+            log.info(
+                "lambda_cls=0: enabling find_unused_parameters (classification head "
+                "runs for reporting but takes no gradient)"
+            )
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            find_unused_parameters=needs_unused,
+        )
 
     loss_module = build_loss(
         seg_kind=cfg.seg_loss,  # type: ignore[arg-type]
