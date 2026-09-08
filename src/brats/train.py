@@ -349,9 +349,8 @@ class CheckpointManager:
                     tracker.summary(f"best_dice_{key}", float(value))
                     tracker.summary(f"best_dice_{key}_epoch", epoch)
 
-        (self.dir / "metrics.jsonl").open("a", encoding="utf-8").write(
-            json.dumps({"epoch": epoch, **metrics}) + "\n"
-        )
+        with (self.dir / "metrics.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"epoch": epoch, **metrics}) + "\n")
 
     def load(
         self,
