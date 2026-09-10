@@ -5,12 +5,16 @@ __pycache__/
 
 # Never commit data or derived caches. Extraction target is C:\data\brats2023,
 # outside this repo, but guard against accidental copies landing here.
-data/
+# NOTE: these are anchored with a leading slash on purpose. An unanchored `data/`
+# matches at *any* depth and silently untracked the whole `src/brats/data/`
+# package -- a clean clone or `git archive` (i.e. a Docker build context) came out
+# with no data pipeline at all.
+/data/
 *.nii
 *.nii.gz
-cache/
-runs/
-checkpoints/
+/cache/
+/runs/
+/checkpoints/
 *.pt
 *.pth
 
