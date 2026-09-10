@@ -1,0 +1,39 @@
+# Line-ending policy: LF in the repository, LF on checkout.
+#
+# This repo is edited from both Windows and WSL and lives inside a OneDrive tree.
+# Without an explicit policy, a Windows editor rewrites every line of every file
+# as CRLF, so `git status` reports all 38 tracked files as modified and real
+# changes are impossible to see in a diff. History is LF throughout except for a
+# handful of files that were committed from a CRLF working tree; `git add
+# --renormalize .` brings those back in line.
+*               text=auto eol=lf
+
+# Source and config: always text, always LF.
+*.py            text eol=lf
+*.md            text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.toml          text eol=lf
+*.sql           text eol=lf
+*.csv           text eol=lf
+*.txt           text eol=lf
+*.json          text eol=lf
+*.cfg           text eol=lf
+*.ipynb         text eol=lf
+
+# Binary: never convert, never diff as text. NIfTI volumes and the npz cache are
+# gitignored, but declare them so an accidental `git add -f` cannot corrupt them.
+*.xlsx          binary
+*.xls           binary
+*.zip           binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.pdf           binary
+*.pt            binary
+*.pth           binary
+*.npy           binary
+*.npz           binary
+*.nii           binary
+*.nii.gz        binary
+*.gz            binary
