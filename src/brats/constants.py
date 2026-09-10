@@ -121,12 +121,13 @@ NOMINAL_SPACING: Final[tuple[float, float, float]] = (1.0, 1.0, 1.0)
 # ---------------------------------------------------------------------------
 # Intensity cache quantization
 # ---------------------------------------------------------------------------
-# The GPU_NV_M node has only 93.13 GiB of local disk. A float16 cache of
-# brain-cropped 4-channel volumes is ~40 MB/case -> ~94 GB for 2350 cases, which
-# does not fit. Quantizing z-scored intensities to uint8 over a fixed +-5 sigma
-# range gives ~22 MB/case -> ~52 GB, with headroom.
+# Measured footprint of the uint8 cache: ~4.3 MB/case compressed on disk
+# (~11.8 GB for 2755 cases) and ~19.2 MB/case resident once decompressed
+# (~52.9 GB). The GPU_NV_M node has 93.13 GiB of local disk, so the on-disk cache
+# is not the binding constraint -- resident memory and per-sample decode cost are,
+# and that is what quantizing to uint8 over a fixed +-5 sigma range buys.
 #
-# Step size is 10 sigma / 255 ~= 0.039 sigma, far below any signal a network can
+# Step size is 10 sigma / 254 ~= 0.039 sigma, far below any signal a network can
 # exploit, so this is a storage decision and not a modeling one.
 
 #: Clip bound in standard deviations before quantizing.

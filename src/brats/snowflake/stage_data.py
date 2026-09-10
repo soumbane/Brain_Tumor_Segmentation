@@ -1,13 +1,17 @@
 """Upload the preprocessed cache and splits to a Snowflake stage.
 
-The uint8 ``.npz`` cache is what gets staged, not the raw NIfTI: ~22 MB/case against
-~14 MB compressed NIfTI, but it removes all decode and normalization work from the
-training node, and it is the artifact the training code actually reads.
+The uint8 ``.npz`` cache is what gets staged, not the raw NIfTI -- not for size
+reasons but because it is the artifact the training code actually reads, and it
+removes all decode and normalization work from the training node.
+:class:`brats.data.transforms.CachedBratsDataset` reads only ``.npz``, and each
+archive already carries ``affine``, ``orig_shape`` and the crop offsets, so
+predictions can be written back into the original 240x240x155 grid without the
+source NIfTI ever being present.
 
-Sizing. 2350 labeled + 405 unlabeled cases at ~22 MB is ~61 GB. The ``GPU_NV_M`` node
-has 93.13 GiB of local disk, so the full cache fits with ~30 GiB of headroom for the
-container image, checkpoints, and scratch. A float16 cache (~40 MB/case, ~110 GB)
-would not have fit -- that is why the cache is quantized.
+Sizing (measured). 2755 cases at ~4.3 MB compressed is ~11.8 GB on disk; the same
+data occupies ~52.9 GB once decompressed in memory. The ``GPU_NV_M`` node has
+93.13 GiB of local disk, so the cache fits with room to spare -- the raw NIfTI
+(~40 GB) would fit alongside it if a future step ever needed it on-node.
 
 Stage storage is billed. Check ``scripts/admin_grants.sql`` and attach a budget before
 uploading tens of gigabytes.
