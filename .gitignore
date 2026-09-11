@@ -32,3 +32,4 @@ reports/confound_features.csv
 # Local tooling
 .snowflake/
 .ipynb_checkpoints/
+.cortex
