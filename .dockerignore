@@ -1,0 +1,49 @@
+# Keep the build context under 1 MB: code + configs + splits only.
+# Data comes from Snowflake stage mounts at runtime.
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Git
+.git/
+.gitattributes
+.gitignore
+
+# Data (never bake into an image)
+/data/
+*.nii
+*.nii.gz
+*.npz
+/cache/
+
+# Training artifacts
+/runs/
+/checkpoints/
+*.pt
+*.pth
+
+# Reports / generated artifacts
+reports/
+external/
+
+# Local tooling
+.snowflake/
+.cortex/
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Documentation (not needed at runtime)
+README.md
+RUNBOOK.md
+*.md

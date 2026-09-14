@@ -1,0 +1,111 @@
+# =============================================================================
+# SPCS service spec for BraTS 2023 training.
+#
+# This is a TEMPLATE. Replace the placeholders before using:
+#   <ORG>-<ACCOUNT>  -> your Snowflake org-account (e.g. MYORG-MYACCOUNT)
+#   <DB>.<SCHEMA>    -> your database.schema (e.g. BRATS_MRI.CORE)
+#
+# Usage (from a SQL worksheet or SnowSQL):
+#
+#   -- Single-GPU training (GPU_NV_S, 1x A10G):
+#   CREATE SERVICE brats_train_1gpu
+#     IN COMPUTE POOL BRATS_GPU_NV_S
+#     FROM SPECIFICATION_FILE = 'service_spec.yaml'
+#     EXTERNAL_ACCESS_INTEGRATIONS = (PYPI_EAI)
+#     MIN_INSTANCES = 1
+#     MAX_INSTANCES = 1;
+#
+#   -- Check logs:
+#   SELECT SYSTEM$GET_SERVICE_LOGS('brats_train_1gpu', 0, 'train');
+#
+#   -- Clean up:
+#   DROP SERVICE IF EXISTS brats_train_1gpu;
+# =============================================================================
+
+spec:
+  containers:
+    - name: train
+      # Image pushed to the Snowflake image repository.
+      # Replace <ORG>-<ACCOUNT> and <DB>.<SCHEMA> with your actual values.
+      image: /<DB>/<SCHEMA>/brats_repo/brats-train:latest
+
+      # --- Entry point ---
+      # Single GPU (GPU_NV_S): plain python, no torchrun needed.
+      # For multi-GPU (GPU_NV_M: 4x A10G), change to:
+      #   command: ["torchrun", "--nproc_per_node=4"]
+      #   args: ["-m", "brats.train", "--config", "/app/configs/segresnet_base.yaml",
+      #          "--checkpoint-dir", "/mnt/ckpt", "--data-root", "/mnt/data",
+      #          "--wandb", "--wandb-mode", "offline", "--resume"]
+      command:
+        - python
+        - -m
+        - brats.train
+      args:
+        - --config
+        - /app/configs/segresnet_base.yaml
+        - --checkpoint-dir
+        - /mnt/ckpt
+        - --wandb
+        - --wandb-mode
+        - offline
+        - --resume
+
+      env:
+        OMP_NUM_THREADS: "8"
+        NCCL_DEBUG: "WARN"
+        WANDB_MODE: "offline"
+        # Override data.yaml paths to point at the stage mounts.
+        BRATS_CACHE_ROOT: "/mnt/data/cache"
+        BRATS_SPLITS_CSV: "/mnt/data/splits/split_random_seed42.csv"
+        BRATS_MANIFEST_DIR: "/mnt/data/manifest"
+
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          memory: 20Gi
+          cpu: 8
+        limits:
+          nvidia.com/gpu: 1
+          memory: 24Gi
+
+      volumeMounts:
+        - name: data-vol
+          mountPath: /mnt/data
+        - name: ckpt-vol
+          mountPath: /mnt/ckpt
+
+  volumes:
+    # The preprocessed .npz cache + splits + manifest, staged via:
+    #   python -m brats.snowflake.stage_data --stage @<DB>.<SCHEMA>.DATA
+    - name: data-vol
+      source: "@<DB>.<SCHEMA>.DATA"
+
+    # Checkpoints written every epoch. On resume, the latest checkpoint is
+    # loaded automatically. Survives service restarts and SPCS maintenance.
+    - name: ckpt-vol
+      source: "@<DB>.<SCHEMA>.CKPT"
+
+
+# =============================================================================
+# Multi-GPU variant (GPU_NV_M: 4x A10G)
+#
+# To use 4 GPUs, create a separate spec or modify the above:
+#
+# 1. Change command to:
+#      command: ["torchrun", "--nproc_per_node=4"]
+#      args: ["-m", "brats.train", ...]
+#
+# 2. Change resources to:
+#      requests:
+#        nvidia.com/gpu: 4
+#        memory: 160Gi
+#        cpu: 40
+#      limits:
+#        nvidia.com/gpu: 4
+#        memory: 178Gi
+#
+# 3. Create with: CREATE SERVICE ... IN COMPUTE POOL BRATS_GPU_NV_M ...
+#
+# torchrun sets RANK/LOCAL_RANK/WORLD_SIZE automatically, which
+# train.py:setup_distributed() reads to initialize DDP with NCCL.
+# =============================================================================
