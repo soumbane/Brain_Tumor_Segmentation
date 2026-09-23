@@ -272,7 +272,9 @@ class CheckpointManager:
 
     def __init__(self, cfg: TrainConfig, root: Path | None = None) -> None:
         self.cfg = cfg
-        self.dir = (root or REPO_ROOT) / cfg.ckpt_dir / cfg.run_name
+        env_root = os.environ.get("BRATS_CKPT_ROOT")
+        base = Path(env_root) if env_root else (root or REPO_ROOT)
+        self.dir = base / cfg.ckpt_dir / cfg.run_name
         self.dir.mkdir(parents=True, exist_ok=True)
         self.best: dict[str, float] = {k: -1.0 for k in TRACKED}
 
