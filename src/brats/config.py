@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,15 +43,17 @@ class DataConfig:
         raw = load_yaml(path)
         paths = raw["paths"]
 
-        def _p(key: str) -> Path:
+        def _p(key: str, env_var: str | None = None) -> Path:
+            if env_var and os.environ.get(env_var):
+                return Path(os.environ[env_var])
             v = Path(paths[key])
             return v if v.is_absolute() else REPO_ROOT / v
 
         return cls(
             archive_root=_p("archive_root"),
-            extract_root=_p("extract_root"),
-            manifest_dir=_p("manifest_dir"),
-            cache_root=_p("cache_root"),
+            extract_root=_p("extract_root", "BRATS_EXTRACT_ROOT"),
+            manifest_dir=_p("manifest_dir", "BRATS_MANIFEST_DIR"),
+            cache_root=_p("cache_root", "BRATS_CACHE_ROOT"),
             reports_dir=_p("reports_dir"),
             archives=raw["archives"],
             ancillary=raw["ancillary"],
