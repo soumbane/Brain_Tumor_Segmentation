@@ -18,10 +18,10 @@
 set -euo pipefail
 
 # ---- Defaults (override via flags or env vars) ----
-ACCOUNT="${SNOWFLAKE_ACCOUNT:-<ORG>-<ACCOUNT>}"
-DB="${SNOWFLAKE_DB:-BRATS_MRI}"
-SCHEMA="${SNOWFLAKE_SCHEMA:-CORE}"
-REPO="BRATS_REPO"
+ACCOUNT="${SNOWFLAKE_ACCOUNT:-SPECTRUMHEALTH-ANALYTICS}"
+DB="${SNOWFLAKE_DB:-USER\$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG}"
+SCHEMA="${SNOWFLAKE_SCHEMA:-BRATS_PROJECT}"
+REPO="brats_repo"
 IMAGE_NAME="brats-train"
 TAG="latest"
 
@@ -73,6 +73,6 @@ echo "Done. Image available at:"
 echo "  ${FULL_TAG}"
 echo ""
 echo "Next steps:"
-echo "  1. Stage data:   python -m brats.snowflake.stage_data --stage @${DB}.${SCHEMA}.DATA"
+echo "  1. Stage data to @${DB}.${SCHEMA}.DATA_STAGE"
 echo "  2. Update spcs/service_spec.yaml with your account details"
-echo "  3. CREATE SERVICE brats_train IN COMPUTE POOL <pool> FROM SPECIFICATION_FILE='service_spec.yaml';"
+echo "  3. EXECUTE JOB SERVICE IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU NAME=brats_train FROM @${DB}.${SCHEMA}.SPEC_STAGE SPEC='service_spec.yaml';"

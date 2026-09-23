@@ -2,21 +2,21 @@
 # SPCS service spec for BraTS 2023 training.
 #
 # This is a TEMPLATE. Replace the placeholders before using:
-#   <ORG>-<ACCOUNT>  -> your Snowflake org-account (e.g. MYORG-MYACCOUNT)
-#   <DB>.<SCHEMA>    -> your database.schema (e.g. BRATS_MRI.CORE)
+#   Configured for: SPECTRUMHEALTH-ANALYTICS
+#   DB: USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG
+#   SCHEMA: BRATS_PROJECT
 #
 # Usage (from a SQL worksheet or SnowSQL):
 #
 #   -- Single-GPU training (GPU_NV_S, 1x A10G):
-#   CREATE SERVICE brats_train_1gpu
-#     IN COMPUTE POOL BRATS_GPU_NV_S
-#     FROM SPECIFICATION_FILE = 'service_spec.yaml'
-#     EXTERNAL_ACCESS_INTEGRATIONS = (PYPI_EAI)
-#     MIN_INSTANCES = 1
-#     MAX_INSTANCES = 1;
+#   EXECUTE JOB SERVICE
+#     IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU
+#     NAME = brats_train_1gpu
+#     FROM @"USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG".BRATS_PROJECT.SPEC_STAGE
+#     SPEC = 'service_spec.yaml';
 #
 #   -- Check logs:
-#   SELECT SYSTEM$GET_SERVICE_LOGS('brats_train_1gpu', 0, 'train');
+#   SELECT SYSTEM$GET_SERVICE_LOGS('BRATS_TRAIN_1GPU', 0, 'train');
 #
 #   -- Clean up:
 #   DROP SERVICE IF EXISTS brats_train_1gpu;
@@ -25,9 +25,7 @@
 spec:
   containers:
     - name: train
-      # Image pushed to the Snowflake image repository.
-      # Replace <ORG>-<ACCOUNT> and <DB>.<SCHEMA> with your actual values.
-      image: /<DB>/<SCHEMA>/brats_repo/brats-train:latest
+      image: /USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG/BRATS_PROJECT/BRATS_REPO/brats-train:latest
 
       # --- Entry point ---
       # Single GPU (GPU_NV_S): plain python, no torchrun needed.
@@ -43,11 +41,7 @@ spec:
       args:
         - --config
         - /app/configs/segresnet_base.yaml
-        - --checkpoint-dir
-        - /mnt/ckpt
-        - --wandb
-        - --wandb-mode
-        - offline
+        - --no-wandb
         - --resume
 
       env:
@@ -75,15 +69,11 @@ spec:
           mountPath: /mnt/ckpt
 
   volumes:
-    # The preprocessed .npz cache + splits + manifest, staged via:
-    #   python -m brats.snowflake.stage_data --stage @<DB>.<SCHEMA>.DATA
     - name: data-vol
-      source: "@<DB>.<SCHEMA>.DATA"
+      source: "@USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG.BRATS_PROJECT.DATA_STAGE"
 
-    # Checkpoints written every epoch. On resume, the latest checkpoint is
-    # loaded automatically. Survives service restarts and SPCS maintenance.
     - name: ckpt-vol
-      source: "@<DB>.<SCHEMA>.CKPT"
+      source: "@USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG.BRATS_PROJECT.CKPT_STAGE"
 
 
 # =============================================================================
