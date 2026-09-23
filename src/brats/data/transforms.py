@@ -189,7 +189,14 @@ def load_records(
         require_cache: Raise if a case has no ``.npz``. Set False to tolerate a
             partially built cache during development.
     """
-    path = Path(splits_csv) if splits_csv else REPO_ROOT / cfg.splits["output"]
+    import os
+
+    if splits_csv:
+        path = Path(splits_csv)
+    elif os.environ.get("BRATS_SPLITS_CSV"):
+        path = Path(os.environ["BRATS_SPLITS_CSV"])
+    else:
+        path = REPO_ROOT / cfg.splits["output"]
     if not path.is_file():
         raise SystemExit(f"No split file at {path}. Run `python -m brats.data.splits`.")
     df = pd.read_csv(path)
