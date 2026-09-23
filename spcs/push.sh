@@ -4,24 +4,24 @@
 #
 # Prerequisites:
 #   1. Docker Desktop running with WSL 2 integration
-#   2. Snowflake image repository created:
-#        CREATE IMAGE REPOSITORY <DB>.<SCHEMA>.BRATS_REPO;
+#   2. Snowflake image repository exists:
+#        CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.TRAINING_IMAGES
 #   3. Docker logged in to the Snowflake registry:
-#        docker login <ORG>-<ACCOUNT>.registry.snowflakecomputing.com \
-#          -u <USERNAME>
+#        snow spcs image-registry login --connection <conn>
+#        -- or --
+#        docker login spectrumhealth-analytics.registry.snowflakecomputing.com
 #
 # Usage:
-#   ./spcs/push.sh                          # uses defaults
-#   ./spcs/push.sh --account MYORG-MYACCT   # override account
-#   ./spcs/push.sh --tag v0.2               # custom tag
+#   ./spcs/push.sh                  # uses defaults
+#   ./spcs/push.sh --tag v0.2      # custom tag
 # =============================================================================
 set -euo pipefail
 
-# ---- Defaults (override via flags or env vars) ----
+# ---- Defaults ----
 ACCOUNT="${SNOWFLAKE_ACCOUNT:-SPECTRUMHEALTH-ANALYTICS}"
-DB="${SNOWFLAKE_DB:-USER\$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG}"
-SCHEMA="${SNOWFLAKE_SCHEMA:-BRATS_PROJECT}"
-REPO="brats_repo"
+DB="${SNOWFLAKE_DB:-CARE_ML_RESEARCH_WKSP}"
+SCHEMA="${SNOWFLAKE_SCHEMA:-BRAIN_TUMOR_SEG}"
+REPO="TRAINING_IMAGES"
 IMAGE_NAME="brats-train"
 TAG="latest"
 
@@ -39,6 +39,8 @@ done
 
 REGISTRY="${ACCOUNT}.registry.snowflakecomputing.com"
 FULL_TAG="${REGISTRY}/${DB}/${SCHEMA}/${REPO}/${IMAGE_NAME}:${TAG}"
+# Snowflake registry requires lowercase
+FULL_TAG=$(echo "$FULL_TAG" | tr '[:upper:]' '[:lower:]')
 
 echo "============================================================"
 echo "BraTS SPCS image push"
@@ -47,12 +49,6 @@ echo "  account  : ${ACCOUNT}"
 echo "  registry : ${REGISTRY}"
 echo "  image    : ${FULL_TAG}"
 echo ""
-
-# ---- Validate ----
-if [[ "$ACCOUNT" == *"<"* ]]; then
-    echo "ERROR: ACCOUNT still contains placeholder. Set --account or SNOWFLAKE_ACCOUNT."
-    exit 1
-fi
 
 # ---- Build ----
 echo "[1/3] Building image..."
@@ -73,6 +69,12 @@ echo "Done. Image available at:"
 echo "  ${FULL_TAG}"
 echo ""
 echo "Next steps:"
-echo "  1. Stage data to @${DB}.${SCHEMA}.DATA_STAGE"
-echo "  2. Update spcs/service_spec.yaml with your account details"
-echo "  3. EXECUTE JOB SERVICE IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU NAME=brats_train FROM @${DB}.${SCHEMA}.SPEC_STAGE SPEC='service_spec.yaml';"
+echo "  1. Upload data:  PUT 'file:///path/to/cache/*' @${DB}.${SCHEMA}.DATASET_STAGE/ AUTO_COMPRESS=FALSE PARALLEL=10;"
+echo "  2. Upload spec:  PUT 'file:///path/to/service_spec.yaml' @${DB}.${SCHEMA}.SPECS_STAGE AUTO_COMPRESS=FALSE OVERWRITE=TRUE;"
+echo "  3. Run training:"
+echo "     USE ROLE SFK_CARE_ML_RSRCH_ADM;"
+echo "     EXECUTE JOB SERVICE"
+echo "       IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU"
+echo "       NAME = BRATS_TRAIN_V1"
+echo "       FROM @${DB}.${SCHEMA}.SPECS_STAGE"
+echo "       SPEC = 'service_spec.yaml';"

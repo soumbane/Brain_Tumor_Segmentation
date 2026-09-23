@@ -1,39 +1,35 @@
 # =============================================================================
-# SPCS service spec for BraTS 2023 training.
+# SPCS job spec for BraTS 2023 single-GPU training.
 #
-# This is a TEMPLATE. Replace the placeholders before using:
-#   Configured for: SPECTRUMHEALTH-ANALYTICS
-#   DB: USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG
-#   SCHEMA: BRATS_PROJECT
+# Database : CARE_ML_RESEARCH_WKSP
+# Schema   : BRAIN_TUMOR_SEG
+# Pool     : SYSTEM_COMPUTE_POOL_GPU (GPU_NV_S, 1x A10G 24 GB)
+# Role     : SFK_CARE_ML_RSRCH_ADM
 #
-# Usage (from a SQL worksheet or SnowSQL):
+# Upload this spec then run:
 #
-#   -- Single-GPU training (GPU_NV_S, 1x A10G):
+#   USE ROLE SFK_CARE_ML_RSRCH_ADM;
+#   USE DATABASE CARE_ML_RESEARCH_WKSP;
+#   USE SCHEMA BRAIN_TUMOR_SEG;
+#
 #   EXECUTE JOB SERVICE
 #     IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU
-#     NAME = brats_train_1gpu
-#     FROM @"USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG".BRATS_PROJECT.SPEC_STAGE
+#     NAME = BRATS_TRAIN_V1
+#     FROM @SPECS_STAGE
 #     SPEC = 'service_spec.yaml';
 #
-#   -- Check logs:
-#   SELECT SYSTEM$GET_SERVICE_LOGS('BRATS_TRAIN_1GPU', 0, 'train');
+# Monitor:
+#   SELECT SYSTEM$GET_SERVICE_LOGS('BRATS_TRAIN_V1', 0, 'train');
 #
-#   -- Clean up:
-#   DROP SERVICE IF EXISTS brats_train_1gpu;
+# Clean up:
+#   DROP SERVICE IF EXISTS BRATS_TRAIN_V1;
 # =============================================================================
 
 spec:
   containers:
     - name: train
-      image: /USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG/BRATS_PROJECT/BRATS_REPO/brats-train:latest
+      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:latest
 
-      # --- Entry point ---
-      # Single GPU (GPU_NV_S): plain python, no torchrun needed.
-      # For multi-GPU (GPU_NV_M: 4x A10G), change to:
-      #   command: ["torchrun", "--nproc_per_node=4"]
-      #   args: ["-m", "brats.train", "--config", "/app/configs/segresnet_base.yaml",
-      #          "--checkpoint-dir", "/mnt/ckpt", "--data-root", "/mnt/data",
-      #          "--wandb", "--wandb-mode", "offline", "--resume"]
       command:
         - python
         - -m
@@ -43,21 +39,29 @@ spec:
         - /app/configs/segresnet_base.yaml
         - --no-wandb
         - --resume
+        - --epochs
+        - "50"
 
       env:
-        OMP_NUM_THREADS: "8"
+        OMP_NUM_THREADS: "6"
         NCCL_DEBUG: "WARN"
-        WANDB_MODE: "offline"
-        # Override data.yaml paths to point at the stage mounts.
-        BRATS_CACHE_ROOT: "/mnt/data/cache"
+        WANDB_MODE: "disabled"
+        # Override data.yaml Windows paths to point at the stage mounts.
+        # DATASET_STAGE is mounted at /mnt/data. Files are uploaded as:
+        #   @DATASET_STAGE/GLI/*.npz, @DATASET_STAGE/MEN/*.npz, @DATASET_STAGE/PED/*.npz
+        #   @DATASET_STAGE/splits/split_random_seed42.csv
+        #   @DATASET_STAGE/manifest/*.csv
+        BRATS_CACHE_ROOT: "/mnt/data"
         BRATS_SPLITS_CSV: "/mnt/data/splits/split_random_seed42.csv"
         BRATS_MANIFEST_DIR: "/mnt/data/manifest"
+        # Write checkpoints to the mounted OUTPUT_STAGE so they survive restarts.
+        BRATS_CKPT_ROOT: "/mnt/ckpt"
 
       resources:
         requests:
           nvidia.com/gpu: 1
           memory: 20Gi
-          cpu: 8
+          cpu: 6
         limits:
           nvidia.com/gpu: 1
           memory: 24Gi
@@ -65,25 +69,27 @@ spec:
       volumeMounts:
         - name: data-vol
           mountPath: /mnt/data
-        - name: ckpt-vol
+        - name: output-vol
           mountPath: /mnt/ckpt
 
   volumes:
+    # Preprocessed .npz cache + splits + manifest, uploaded via SnowSQL PUT.
     - name: data-vol
-      source: "@USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG.BRATS_PROJECT.DATA_STAGE"
+      source: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.DATASET_STAGE"
 
-    - name: ckpt-vol
-      source: "@USER$SOUMYANIL.BANERJEE@COREWELLHEALTH.ORG.BRATS_PROJECT.CKPT_STAGE"
+    # Checkpoints written every epoch. On resume, the latest checkpoint is
+    # loaded automatically. Survives SPCS maintenance restarts.
+    - name: output-vol
+      source: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE"
 
 
 # =============================================================================
-# Multi-GPU variant (GPU_NV_M: 4x A10G)
-#
-# To use 4 GPUs, create a separate spec or modify the above:
+# Multi-GPU variant (GPU_NV_M: 4x A10G) -- requires a dedicated compute pool.
 #
 # 1. Change command to:
 #      command: ["torchrun", "--nproc_per_node=4"]
-#      args: ["-m", "brats.train", ...]
+#      args: ["-m", "brats.train", "--config", "/app/configs/segresnet_base.yaml",
+#             "--no-wandb", "--resume"]
 #
 # 2. Change resources to:
 #      requests:
@@ -94,8 +100,5 @@ spec:
 #        nvidia.com/gpu: 4
 #        memory: 178Gi
 #
-# 3. Create with: CREATE SERVICE ... IN COMPUTE POOL BRATS_GPU_NV_M ...
-#
-# torchrun sets RANK/LOCAL_RANK/WORLD_SIZE automatically, which
-# train.py:setup_distributed() reads to initialize DDP with NCCL.
+# 3. Run on a GPU_NV_M pool (not SYSTEM_COMPUTE_POOL_GPU which is GPU_NV_S).
 # =============================================================================
