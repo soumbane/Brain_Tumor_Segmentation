@@ -34,7 +34,6 @@ spec:
         - python
         - -m
         - brats.train
-      args:
         - --config
         - /app/configs/segresnet_base.yaml
         - --no-wandb
