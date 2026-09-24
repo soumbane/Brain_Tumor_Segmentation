@@ -33,3 +33,5 @@ reports/confound_features.csv
 .snowflake/
 .ipynb_checkpoints/
 .cortex
+
+docs/
