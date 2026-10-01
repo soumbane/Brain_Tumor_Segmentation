@@ -1,0 +1,40 @@
+# Full training dependencies for GPU environments (HPC, Databricks, cloud VMs).
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# NOTE: PyTorch with CUDA must be installed FIRST from the PyTorch index.
+# The default PyPI torch wheel is CPU-only. Install the CUDA version:
+#
+#   pip install torch>=2.4 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+#
+# Or if your environment already has torch+CUDA (NGC container, Databricks ML
+# runtime, SPCS, conda with pytorch-cuda), skip the torch install and just run:
+#   pip install -r requirements.txt
+
+# --- Deep learning framework ---
+# torch>=2.4              # install separately with CUDA; see note above
+monai[nibabel,tqdm,einops]>=1.4
+einops
+
+# --- Medical imaging ---
+nibabel>=5.2
+connected-components-3d>=3.12
+
+# --- Scientific computing ---
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+scikit-learn>=1.4
+
+# --- Visualization ---
+matplotlib>=3.8
+
+# --- Config / IO ---
+pyyaml>=6.0
+tqdm>=4.66
+openpyxl>=3.1
+
+# --- Experiment tracking ---
+wandb>=0.17
