@@ -14,7 +14,8 @@ paths:
   # Preprocessed uint8 cache (~52 GB). Kept on local disk, outside OneDrive: a cache
   # this size inside the synced tree would be uploaded to corporate cloud storage,
   # and active sync can lock files mid-write.
-  cache_root: 'C:\data\brats2023\_cache'
+  # cache_root: 'C:\data\brats2023\_cache'
+  cache_root: '/Volumes/imaging_research/brain_tumor_segmentation/brats_dataset'
   reports_dir: 'reports'
 
 # Archive filenames per cohort. `train` has seg.nii.gz; `val` does not.
