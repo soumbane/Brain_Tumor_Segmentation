@@ -83,8 +83,8 @@ def extract_embeddings(
                 from brats.constants import REGION_INDEX
 
                 wt_ch = REGION_INDEX["WT"]
-                wt = torch.sigmoid(seg_list[0][:, wt_ch : wt_ch + 1])
-                pooled = net.pool(bottleneck, wt_prob=wt, gt_wt=None, alpha=0.0)
+                wt_logit = seg_list[0][:, wt_ch : wt_ch + 1].float()
+                pooled = net.pool(bottleneck, wt_logit=wt_logit, gt_wt=None, alpha=0.0)
             else:
                 pooled = bottleneck.mean(dim=tuple(range(2, bottleneck.ndim)))
 

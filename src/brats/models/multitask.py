@@ -200,14 +200,16 @@ class MultiTaskBraTS(nn.Module):
         # Attention weight from the model's own WT prediction, detached so the
         # classification loss cannot corrupt the segmentation decoder through the
         # attention path -- the classifier adapts to the segmentation, not the
-        # reverse.
-        wt_prob = torch.sigmoid(finest[:, WT_CHANNEL : WT_CHANNEL + 1].detach())
+        # reverse. Handed over as a float32 *logit*: under bf16 autocast a
+        # sigmoid-then-logit round trip saturates to inf and yields NaN gradients
+        # (see TumorAttentionPool).
+        wt_logit = finest[:, WT_CHANNEL : WT_CHANNEL + 1].detach().float()
 
         alpha = self._alpha if (self.training and gt_wt is not None) else 0.0
         pool_input = feats[-3:] if self.cfg.pooling == "tafe" else bottleneck
         pooled = self.pool(
             pool_input,
-            wt_prob=wt_prob,
+            wt_logit=wt_logit,
             gt_wt=gt_wt if self.training else None,
             alpha=alpha,
         )

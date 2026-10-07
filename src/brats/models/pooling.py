@@ -52,7 +52,7 @@ class GlobalAveragePool(nn.Module):
     """Option A. Flat mean over spatial dims. The confound-exposed baseline."""
 
     def forward(
-        self, feat: Tensor, wt_prob: Tensor | None = None, gt_wt: Tensor | None = None,
+        self, feat: Tensor, wt_logit: Tensor | None = None, gt_wt: Tensor | None = None,
         alpha: float = 0.0,
     ) -> Tensor:
         return feat.mean(dim=tuple(range(2, feat.ndim)))
@@ -69,6 +69,13 @@ class TumorAttentionPool(nn.Module):
             before the sigmoid, letting the model sharpen or soften its own
             attention rather than being stuck with the segmentation head's
             calibration.
+
+    The pool consumes the WT **logit**, not a probability, and does the
+    temperature scaling and sigmoid itself in float32. Round-tripping through a
+    probability is numerically unsafe under bf16 autocast: ``sigmoid`` saturates to
+    exactly 1.0 once the logit exceeds ~6.2, ``logit(1.0)`` is ``inf``, and the
+    backward pass then produces ``0 * inf = NaN`` on the temperature, which
+    ``clip_grad_norm_`` spreads to every parameter in a single step.
     """
 
     def __init__(self, floor: float = 0.01, learn_temperature: bool = True) -> None:
@@ -81,7 +88,7 @@ class TumorAttentionPool(nn.Module):
     def forward(
         self,
         feat: Tensor,
-        wt_prob: Tensor | None = None,
+        wt_logit: Tensor | None = None,
         gt_wt: Tensor | None = None,
         alpha: float = 0.0,
     ) -> Tensor:
@@ -89,7 +96,9 @@ class TumorAttentionPool(nn.Module):
 
         Args:
             feat: Encoder bottleneck features.
-            wt_prob: Predicted WT *probability* (B,1,d,h,w) at any resolution.
+            wt_logit: Predicted WT *logit* (B,1,d,h,w) at any resolution. Treated as
+                a constant (callers detach it); computed in float32 regardless of
+                the autocast dtype.
             gt_wt: Ground-truth WT binary mask (B,1,D,H,W), training only.
             alpha: Weight on the GT mask. ``1.0`` = pure teacher forcing,
                 ``0.0`` = pure prediction. Annealed by the training loop; must be
@@ -97,18 +106,17 @@ class TumorAttentionPool(nn.Module):
         """
         spatial = tuple(feat.shape[2:])
 
-        if wt_prob is None and gt_wt is None:
+        if wt_logit is None and gt_wt is None:
             # Nothing to attend with; degrade to a mean rather than fail.
             return feat.mean(dim=tuple(range(2, feat.ndim)))
 
         weight: Tensor | None = None
-        if wt_prob is not None:
-            w = wt_prob
+        if wt_logit is not None:
+            z = wt_logit.float()
             if self.log_temperature is not None:
-                # Re-sharpen in logit space; clamp keeps the logit finite.
-                logit = torch.logit(w.clamp(1e-6, 1 - 1e-6))
-                w = torch.sigmoid(logit * self.log_temperature.exp())
-            weight = _downsample_to(w, spatial)
+                # Sharpen or soften directly in logit space.
+                z = z * self.log_temperature.exp()
+            weight = _downsample_to(torch.sigmoid(z), spatial)
 
         if gt_wt is not None and alpha > 0.0:
             gt = _downsample_to(gt_wt.to(feat.dtype), spatial)
@@ -145,7 +153,7 @@ class TAFEPool(nn.Module):
     def forward(
         self,
         feats: list[Tensor],
-        wt_prob: Tensor | None = None,
+        wt_logit: Tensor | None = None,
         gt_wt: Tensor | None = None,
         alpha: float = 0.0,
     ) -> Tensor:
@@ -154,7 +162,7 @@ class TAFEPool(nn.Module):
                 f"expected {len(self.projections)} feature levels, got {len(feats)}"
             )
         pooled = [
-            proj(self.pool(f, wt_prob=wt_prob, gt_wt=gt_wt, alpha=alpha))
+            proj(self.pool(f, wt_logit=wt_logit, gt_wt=gt_wt, alpha=alpha))
             for proj, f in zip(self.projections, feats, strict=True)
         ]
         return self.fuse(torch.cat(pooled, dim=1))
