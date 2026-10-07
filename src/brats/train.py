@@ -55,6 +55,7 @@ from brats.data.transforms import (
     CachedBratsDataset,
     collate_metadata,
     load_records,
+    seed_worker,
     train_transforms,
     val_transforms,
 )
@@ -263,6 +264,7 @@ def build_loaders(
         drop_last=True,
         persistent_workers=cfg.num_workers > 0,
         collate_fn=collate_metadata,
+        worker_init_fn=seed_worker,
     )
     # Validation runs full volumes through sliding-window inference: batch size 1.
     val_loader = DataLoader(
@@ -272,6 +274,7 @@ def build_loaders(
         num_workers=max(2, cfg.num_workers // 2),
         pin_memory=True,
         collate_fn=collate_metadata,
+        worker_init_fn=seed_worker,
     )
     return train_loader, val_loader, val_recs
 

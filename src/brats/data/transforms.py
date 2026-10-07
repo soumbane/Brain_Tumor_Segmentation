@@ -59,6 +59,12 @@ class CachedBratsDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
+    def set_random_state(self, seed: int | None = None, state=None) -> "CachedBratsDataset":
+        """Re-seed the random transforms (the hook MONAI's ``worker_init_fn`` expects)."""
+        if self.transform is not None and hasattr(self.transform, "set_random_state"):
+            self.transform.set_random_state(seed=seed, state=state)
+        return self
+
     def _load(self, rec: dict[str, Any]) -> dict[str, Any]:
         with np.load(rec["cache_path"]) as z:
             img = dequantize(z["img"]).astype(np.float32)
@@ -262,6 +268,22 @@ def build_datasets(
     return out
 
 
+def seed_worker(worker_id: int) -> None:
+    """``worker_init_fn``: give every DataLoader worker its own augmentation random stream.
+
+    MONAI random transforms draw from a ``RandomState`` created when the transform is
+    built. A plain ``torch.utils.data.DataLoader`` copies that object into every worker, so
+    all workers replay the *same* flips, crop offsets and affine parameters, and
+    ``torch.manual_seed`` never reaches it. (MONAI's own ``DataLoader`` does this re-seeding;
+    we use the torch one.) ``worker_info.seed`` is ``base_seed + worker_id``, and
+    ``base_seed`` comes from the torch RNG, so streams are distinct per worker and per rank
+    (``set_seed`` offsets by rank) yet reproducible for a fixed ``--seed``.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, "set_random_state"):
+        info.dataset.set_random_state(seed=info.seed % (2**32))
+
+
 def collate_metadata(batch: list[Any]) -> dict[str, Any]:
     """Collate that keeps string metadata as lists instead of trying to stack it.
 
@@ -291,6 +313,7 @@ __all__ = [
     "load_records",
     "build_datasets",
     "collate_metadata",
+    "seed_worker",
     "REGIONS",
     "SEQUENCES",
 ]
