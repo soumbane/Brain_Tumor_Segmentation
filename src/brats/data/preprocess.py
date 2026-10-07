@@ -89,10 +89,23 @@ def quantize(z: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.where(mask, codes, np.uint8(QUANT_BACKGROUND_CODE))
 
 
+#: Value an in-brain voxel decodes to when its z-score is exactly 0.0.
+IN_BRAIN_ZERO = np.float32(1e-6)
+
+
 def dequantize(codes: np.ndarray) -> np.ndarray:
-    """Inverse of :func:`quantize`; background maps back to exactly 0.0."""
+    """Inverse of :func:`quantize`; background maps back to exactly 0.0.
+
+    The code grid is symmetric, so code 128 decodes to a z-score of exactly 0.0 -- the same
+    value as background. Anything that treats ``image != 0`` as "inside the brain" would
+    then punch holes in the brain at every voxel within ~0.02 sigma of the channel mean
+    (~1-2% of voxels). Such voxels decode to ``IN_BRAIN_ZERO`` instead, which is 20,000x
+    smaller than the quantization step and so changes nothing a network can see, while
+    keeping ``image != 0`` an exact brain mask.
+    """
     scale = quant_scale()
     z = (codes.astype(np.float32) - QUANT_MIN_CODE) * scale - QUANT_CLIP_SIGMA
+    z = np.where(z == 0.0, IN_BRAIN_ZERO, z)
     return np.where(codes == QUANT_BACKGROUND_CODE, np.float32(0.0), z)
 
 

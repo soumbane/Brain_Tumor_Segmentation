@@ -105,6 +105,60 @@ class CachedBratsDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
+_FG_KEY = "_foreground"
+
+
+def _record_foreground(image):
+    return image != 0
+
+
+class RecordForegroundd:
+    """Remember which voxels are inside the brain (``!= 0``) before intensity augmentation."""
+
+    def __call__(self, data):
+        d = dict(data)
+        d[_FG_KEY] = _record_foreground(d["image"])
+        return d
+
+
+class RestoreBackgroundd:
+    """Zero everything that was background, then drop the recorded mask."""
+
+    def __call__(self, data):
+        d = dict(data)
+        d["image"] = d["image"] * d.pop(_FG_KEY)
+        return d
+
+
+def intensity_augmentations(
+    p_scale: float = 0.3, p_shift: float = 0.3, p_noise: float = 0.15, p_smooth: float = 0.15
+) -> list:
+    """Scale / shift / noise / blur, applied to the brain only.
+
+    The cache stores background as exactly 0 and inference sees exactly that. Shifting,
+    noising or blurring the *whole* volume would give the model background that is 0.1
+    (or noisy, or bled into) on a third of its training samples and never at test time.
+    The brain mask is recorded first and the background restored afterwards, so the
+    augmentations only perturb tissue.
+    """
+    from monai import transforms as T
+
+    return [
+        RecordForegroundd(),
+        T.RandScaleIntensityd(keys="image", factors=0.1, prob=p_scale),
+        T.RandShiftIntensityd(keys="image", offsets=0.1, prob=p_shift),
+        T.RandGaussianNoised(keys="image", prob=p_noise, mean=0.0, std=0.05),
+        T.RandGaussianSmoothd(
+            keys="image",
+            prob=p_smooth,
+            sigma_x=(0.5, 1.0),
+            sigma_y=(0.5, 1.0),
+            sigma_z=(0.5, 1.0),
+        ),
+        RestoreBackgroundd(),
+    ]
+
+
 def train_transforms(
     patch_size: tuple[int, int, int] = (128, 128, 128),
     pos_ratio: float = 0.8,
@@ -146,16 +200,7 @@ def train_transforms(
                 mode=("bilinear", "nearest"),  # never interpolate labels
                 padding_mode="zeros",
             ),
-            T.RandScaleIntensityd(keys="image", factors=0.1, prob=0.3),
-            T.RandShiftIntensityd(keys="image", offsets=0.1, prob=0.3),
-            T.RandGaussianNoised(keys="image", prob=0.15, mean=0.0, std=0.05),
-            T.RandGaussianSmoothd(
-                keys="image",
-                prob=0.15,
-                sigma_x=(0.5, 1.0),
-                sigma_y=(0.5, 1.0),
-                sigma_z=(0.5, 1.0),
-            ),
+            *intensity_augmentations(),
             T.EnsureTyped(keys=["image", "label"], dtype=torch.float32),
         ]
     )
@@ -308,6 +353,7 @@ def collate_metadata(batch: list[Any]) -> dict[str, Any]:
 
 __all__ = [
     "CachedBratsDataset",
+    "intensity_augmentations",
     "train_transforms",
     "val_transforms",
     "load_records",
