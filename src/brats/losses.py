@@ -171,7 +171,10 @@ class ClsLoss(nn.Module):
     ) -> None:
         super().__init__()
         w = class_weights if class_weights is not None else cohort_class_weights()
-        self.register_buffer("class_weights", w)
+        # Configuration, not state: persisting it would let a resumed run silently
+        # inherit the weights of whatever run wrote the checkpoint (see the trainer's
+        # sampler/class-weight handling), regardless of what this run asked for.
+        self.register_buffer("class_weights", w, persistent=False)
         self.label_smoothing = float(label_smoothing)
 
     def forward(self, logits: Tensor, target: Tensor) -> Tensor:

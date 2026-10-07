@@ -206,6 +206,17 @@ def _cohort_sample_weights(records: list[dict]) -> list[float]:
     return [1.0 / counts[r["cohort"]] for r in records]
 
 
+def uses_balanced_sampler(cfg: TrainConfig, world_size: int) -> bool:
+    """Whether a cohort-balancing sampler is actually in effect.
+
+    Only single-process runs get one: under DDP the ``DistributedSampler`` owns sharding
+    and mixing in a ``WeightedRandomSampler`` would double-count cases. When it is in
+    effect the classification loss must NOT also be class-weighted, or the minority
+    cohort is corrected twice (a ~12x over-weighting of PED).
+    """
+    return bool(cfg.cohort_balanced_sampling) and world_size == 1
+
+
 def build_loaders(
     cfg: TrainConfig, data_cfg: DataConfig, rank: int, world_size: int
 ) -> tuple[DataLoader, DataLoader, list[dict]]:
@@ -226,7 +237,7 @@ def build_loaders(
         val_recs, transform=val_transforms(True), load_label=True
     )
 
-    if cfg.cohort_balanced_sampling and world_size == 1:
+    if uses_balanced_sampler(cfg, world_size):
         sampler: Any = WeightedRandomSampler(
             _cohort_sample_weights(train_recs), num_samples=len(train_recs), replacement=True
         )
@@ -383,7 +394,11 @@ class CheckpointManager:
         if scheduler is not None and state.get("scheduler"):
             scheduler.load_state_dict(state["scheduler"])
         if loss_module is not None and state.get("loss_module"):
-            loss_module.load_state_dict(state["loss_module"])
+            # Only parameters, e.g. uncertainty log-variances. Checkpoints written before
+            # `class_weights` became non-persistent carry that key; drop what this module
+            # does not own rather than failing (or, worse, importing stale weights).
+            own = loss_module.state_dict()
+            loss_module.load_state_dict({k: v for k, v in state["loss_module"].items() if k in own})
         self.best = state.get("best", self.best)
         rng = state.get("rng")
         if rng:
@@ -576,11 +591,26 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
             find_unused_parameters=needs_unused,
         )
 
+    balanced_sampler = uses_balanced_sampler(cfg, world_size)
+    if is_main(rank):
+        if cfg.cohort_balanced_sampling and not balanced_sampler:
+            log.warning(
+                "cohort_balanced_sampling is ignored under DDP (world_size=%d); cohort "
+                "balance is carried by the class-weighted classification loss instead",
+                world_size,
+            )
+        log.info(
+            "cohort balance via %s",
+            "weighted sampler (CE unweighted)" if balanced_sampler else "class-weighted CE",
+        )
     loss_module = build_loss(
         seg_kind=cfg.seg_loss,  # type: ignore[arg-type]
         lambda_cls=cfg.lambda_cls,
         weighting=cfg.loss_weighting,  # type: ignore[arg-type]
         batch_dice=cfg.batch_dice,
+        # Sampler already balances the batches: weighting the CE as well would correct
+        # the minority cohort twice.
+        class_weights=torch.ones(len(COHORTS)) if balanced_sampler else None,
     ).to(device)
 
     params = list(model.parameters()) + list(loss_module.parameters())
