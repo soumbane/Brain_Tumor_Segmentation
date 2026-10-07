@@ -10,6 +10,11 @@ Rules (from the plan, all enforced here rather than by convention):
   every metric is optimistic.
 * **Fixed seed**, deterministic output, written to a committed CSV.
 
+  The committed ``splits/split_random_seed42.csv`` was written by an earlier version
+  that seeded from the process-randomised ``hash()``, so it is **not** reproducible by
+  this code (nor by that code). It is the source of truth: validate it with
+  ``--check``; do not regenerate it.
+
 The official ValidationData (405 cases) is *not* part of this split. It has no
 ``seg.nii.gz`` so segmentation cannot be scored on it -- but its cohort label is
 known from the archive it shipped in, which makes it a legitimate and larger
@@ -27,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -67,8 +73,11 @@ def assign_splits(
             continue
 
         patients = np.sort(sub.patient_id.unique())
-        # Seed per cohort so adding a cohort later cannot reshuffle the others.
-        rng = np.random.default_rng(abs(hash((seed, cohort))) % (2**32))
+        # Seed per cohort so adding a cohort later cannot reshuffle the others. Derived
+        # from stable inputs only: the built-in hash() of a str is randomised per
+        # process (PYTHONHASHSEED), so the earlier `hash((seed, cohort))` gave a
+        # different split on every run.
+        rng = np.random.default_rng([seed, zlib.crc32(cohort.encode("utf-8"))])
         rng.shuffle(patients)
 
         n = len(patients)
