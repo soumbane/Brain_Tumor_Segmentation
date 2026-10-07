@@ -84,12 +84,20 @@ def upload(
 ) -> int:
     """Upload cache files, splits, and the manifest to ``stage``.
 
-    Files are placed under ``<stage>/cache/<cohort>/`` so the training container can
-    mount one prefix and resolve paths by cohort.
-    """
-    from snowflake.snowpark import Session
+    Layout, which must match ``spcs/service_spec.yaml`` (``BRATS_CACHE_ROOT=/mnt/data``)::
 
-    session = session or Session.builder.getOrCreate()
+        <stage>/GLI/*.npz  <stage>/MEN/*.npz  <stage>/PED/*.npz
+        <stage>/splits/split_random_seed42.csv
+        <stage>/manifest/*.csv
+
+    Mounted at ``/mnt/data`` this is exactly what ``load_records`` reads
+    (``<cache_root>/<cohort>/<case_id>.npz``). It used to upload under ``cache/``, which
+    that path never looked in.
+    """
+    if session is None:
+        from snowflake.snowpark import Session
+
+        session = Session.builder.getOrCreate()
 
     files = sorted(cfg.cache_root.rglob("*.npz"))
     if limit:
@@ -105,7 +113,7 @@ def upload(
         cohort = f.parent.name
         session.file.put(
             str(f),
-            f"{stage}/cache/{cohort}/",
+            f"{stage}/{cohort}/",
             overwrite=overwrite,
             auto_compress=False,  # already compressed; recompressing wastes CPU
         )

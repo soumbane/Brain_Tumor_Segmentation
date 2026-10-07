@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import textwrap
 from pathlib import Path
 
 from brats.config import REPO_ROOT
@@ -60,99 +59,29 @@ PIP_REQUIREMENTS = [
 ]
 
 
-def smoke_test_source() -> str:
-    """Entry point for the Phase 2 exit criterion."""
-    return textwrap.dedent(
-        '''
-        """GPU smoke test: 4 GPUs, bf16, and one cached case round-tripping."""
-        import os, glob
-        import numpy as np
-        import torch
+#: The smoke test and the entry point are real files, not strings embedded here. Earlier
+#: versions kept a second copy in this module and regenerated the file from it on every
+#: submit, so editing the file had no lasting effect.
+SMOKE_TEST_PATH = REPO_ROOT / "scripts" / "gpu_smoke_test.py"
+TRAIN_ENTRY_RELPATH = "brats/snowflake/_train_entry.py"
 
 
-        def main():
-            print("=" * 60)
-            print("GPU_NV_M smoke test")
-            print("=" * 60)
+def build_payload_dir(dest: Path | None = None) -> Path:
+    """Assemble the ML-Job payload: the ``brats`` package plus ``configs/`` and ``splits/``.
 
-            print(f"torch                : {torch.__version__}")
-            print(f"cuda available       : {torch.cuda.is_available()}")
-            n = torch.cuda.device_count()
-            print(f"device count         : {n}  (expected 4 on GPU_NV_M)")
-            for i in range(n):
-                p = torch.cuda.get_device_properties(i)
-                print(f"  cuda:{i} {p.name}  {p.total_memory / 1e9:.1f} GB  sm_{p.major}{p.minor}")
+    The payload root must contain ``brats/`` (so the entry point can import it) *and*
+    ``configs/data.yaml`` (which :data:`brats.config.REPO_ROOT` searches for upward from
+    ``brats/config.py``). Uploading ``src/`` alone left both ``configs/`` and ``splits/``
+    behind, so the job could not find its own configuration.
+    """
+    import shutil
+    import tempfile
 
-            assert torch.cuda.is_available(), "no CUDA device visible"
-            if n != 4:
-                print(f"WARNING: expected 4 GPUs, saw {n}")
-
-            # bf16 is the project's precision of choice; A10G is Ampere so it is native.
-            bf16_ok = torch.cuda.is_bf16_supported()
-            print(f"bf16 supported       : {bf16_ok}")
-            assert bf16_ok, "bf16 unsupported -- the training recipe assumes it"
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                a = torch.randn(512, 512, device="cuda")
-                out = (a @ a).float()
-            print(f"bf16 matmul          : ok (mean {out.mean().item():.4f})")
-
-            # NCCL presence: multi-GPU DDP depends on it. Linux SPCS has it; Windows
-            # would not, which is why all training runs remotely.
-            print(f"nccl available       : {torch.distributed.is_nccl_available()}")
-
-            print(f"cpu count            : {os.cpu_count()}  (expected 44)")
-
-            # One cached case: shape, dtype, and the label invariant.
-            hits = sorted(glob.glob("/mnt/data/cache/**/*.npz", recursive=True))
-            print(f"cached npz visible   : {len(hits)}")
-            if hits:
-                with np.load(hits[0]) as z:
-                    print(f"  file        : {hits[0]}")
-                    print(f"  img shape   : {z['img'].shape}  dtype {z['img'].dtype}")
-                    print(f"  orig shape  : {z['orig_shape']}")
-                    if "seg" in z.files:
-                        vals = np.unique(z["seg"])
-                        print(f"  label values: {vals.tolist()}")
-                        assert vals.max() <= 3, (
-                            f"label {vals.max()} > 3: this is NOT BraTS 2023 "
-                            "(label 4 is the 2021 convention and silently empties ET)"
-                        )
-                        print("  label check : OK (no 4s -- ET is label 3)")
-            else:
-                print("  no cache mounted; stage the cache before training")
-
-            # MONAI import and a forward pass through the real model.
-            from monai.networks.nets import SegResNetDS
-            print("monai import         : ok")
-            net = SegResNetDS(
-                spatial_dims=3, init_filters=32, in_channels=4, out_channels=3,
-                blocks_down=(1, 2, 2, 4), dsdepth=4,
-            ).cuda()
-            x = torch.randn(1, 4, 128, 128, 128, device="cuda")
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                y = net(x)
-            shapes = [tuple(t.shape) for t in (y if isinstance(y, (list, tuple)) else [y])]
-            print(f"forward 128^3        : {shapes}")
-            peak = torch.cuda.max_memory_allocated() / 1e9
-            print(f"peak VRAM (batch 1)  : {peak:.2f} GB of 24 GB")
-            print(f"projected batch 2    : ~{peak * 2:.2f} GB")
-
-            print("\\nSMOKE TEST PASSED")
-            return {"gpus": n, "bf16": bf16_ok, "peak_gb": peak, "cached": len(hits)}
-
-
-        if __name__ == "__main__":
-            __return__ = main()
-        '''
-    ).strip()
-
-
-def write_smoke_test(path: Path | None = None) -> Path:
-    """Materialize the smoke-test payload next to the package."""
-    dest = path or (REPO_ROOT / "scripts" / "gpu_smoke_test.py")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(smoke_test_source() + "\n", encoding="utf-8")
-    log.info("wrote %s", dest)
+    dest = Path(dest) if dest else Path(tempfile.mkdtemp(prefix="brats_payload_"))
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    shutil.copytree(REPO_ROOT / "src" / "brats", dest / "brats", ignore=ignore, dirs_exist_ok=True)
+    for name in ("configs", "splits"):
+        shutil.copytree(REPO_ROOT / name, dest / name, ignore=ignore, dirs_exist_ok=True)
     return dest
 
 
@@ -166,10 +95,11 @@ def submit_smoke_test(compute_pool: str = COMPUTE_POOL, session=None):
     """Run the smoke test on one GPU of the pool."""
     from snowflake.ml.jobs import submit_file
 
-    path = write_smoke_test()
+    if not SMOKE_TEST_PATH.is_file():
+        raise SystemExit(f"smoke test not found: {SMOKE_TEST_PATH}")
     session = session or _session()
     job = submit_file(
-        str(path),
+        str(SMOKE_TEST_PATH),
         compute_pool,
         stage_name=PAYLOAD_STAGE,
         pip_requirements=PIP_REQUIREMENTS,
@@ -248,10 +178,12 @@ def submit_training(
             )
 
     session = session or _session()
+    payload = build_payload_dir()
+    log.info("payload assembled at %s", payload)
     job = submit_directory(
-        str(REPO_ROOT / "src"),
+        str(payload),
         compute_pool,
-        entrypoint="brats/snowflake/_train_entry.py",
+        entrypoint=TRAIN_ENTRY_RELPATH,
         stage_name=PAYLOAD_STAGE,
         args=args,
         pip_requirements=PIP_REQUIREMENTS,
@@ -276,96 +208,6 @@ def submit_training(
             WANDB_EAI,
         )
     return job
-
-
-TRAIN_ENTRY_SOURCE = textwrap.dedent(
-    '''
-    """ML Job entry point: launch brats.train across the node's 4 GPUs.
-
-    Kept deliberately thin. PyTorchDistributor owns process/rank setup; all training
-    logic lives in brats.train, which stays runnable under plain torchrun so the same
-    code path is exercised locally and remotely.
-    """
-
-    import argparse
-    import sys
-
-
-    def main():
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--config", default="configs/segresnet_base.yaml")
-        ap.add_argument("--epochs", type=int, default=None)
-        ap.add_argument("--lambda-cls", type=float, default=None)
-        ap.add_argument("--run-name", default=None)
-        ap.add_argument("--stage-uri", default="")
-        ap.add_argument("--resume", action="store_true")
-        args = ap.parse_args()
-
-        from snowflake.ml.modeling.distributors.pytorch import (
-            PyTorchDistributor,
-            PyTorchScalingConfig,
-            WorkerResourceConfig,
-        )
-
-        def train_func():
-            import os
-
-            import torch.distributed as dist
-            from snowflake.ml.modeling.distributors.pytorch import get_context
-
-            ctx = get_context()
-            # Bridge Snowflake's context into the env vars torch DDP expects, so
-            # brats.train needs no Snowflake-specific branch.
-            os.environ["RANK"] = str(ctx.get_rank())
-            os.environ["LOCAL_RANK"] = str(ctx.get_local_rank())
-            os.environ["WORLD_SIZE"] = str(ctx.get_world_size())
-
-            from brats.config import DataConfig
-            from brats.train import TrainConfig, train
-
-            cfg = TrainConfig.from_yaml(args.config)
-            if args.epochs is not None:
-                cfg.epochs = args.epochs
-            if args.lambda_cls is not None:
-                cfg.lambda_cls = args.lambda_cls
-            if args.run_name:
-                cfg.run_name = args.run_name
-            if args.stage_uri:
-                cfg.stage_uri = args.stage_uri
-
-            train(cfg, DataConfig.load(), resume=args.resume)
-            if dist.is_initialized():
-                dist.destroy_process_group()
-
-        distributor = PyTorchDistributor(
-            train_func=train_func,
-            scaling_config=PyTorchScalingConfig(
-                num_nodes=1,                # GPU_NV_M is a single 4-GPU node
-                num_workers_per_node=4,     # one worker per A10G
-                resource_requirements_per_worker=WorkerResourceConfig(
-                    num_cpus=10,            # 44 vCPU / 4 ranks, leaving headroom
-                    num_gpus=1,
-                ),
-            ),
-        )
-        # No dataset_map: our data is .npz on a stage, not a Snowflake table, so
-        # sharding is handled by DistributedSampler rather than ShardedDataConnector.
-        distributor.run()
-        return 0
-
-
-    if __name__ == "__main__":
-        __return__ = main()
-    '''
-).strip()
-
-
-def write_train_entry(path: Path | None = None) -> Path:
-    dest = path or (REPO_ROOT / "src" / "brats" / "snowflake" / "_train_entry.py")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(TRAIN_ENTRY_SOURCE + "\n", encoding="utf-8")
-    log.info("wrote %s", dest)
-    return dest
 
 
 def job_status(job_id: str, tail_logs: bool = True, session=None) -> None:
@@ -401,15 +243,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--write-payloads",
         action="store_true",
-        help="generate the payload scripts locally without submitting anything",
+        help="assemble the training payload directory locally and print its path, "
+        "without submitting anything",
     )
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
 
     if args.write_payloads:
-        write_smoke_test()
-        write_train_entry()
+        print(build_payload_dir())
         return 0
 
     if args.status:
@@ -423,7 +265,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.train:
-        write_train_entry()
         job = submit_training(
             compute_pool=args.compute_pool,
             config=args.config,
@@ -445,8 +286,9 @@ __all__ = [
     "submit_smoke_test",
     "submit_training",
     "job_status",
-    "write_smoke_test",
-    "write_train_entry",
+    "build_payload_dir",
+    "SMOKE_TEST_PATH",
+    "TRAIN_ENTRY_RELPATH",
     "COMPUTE_POOL",
     "PIP_REQUIREMENTS",
 ]

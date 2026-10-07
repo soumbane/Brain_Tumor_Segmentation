@@ -9,8 +9,27 @@ from typing import Any
 
 import yaml
 
-#: Repository root, resolved from this file's location (src/brats/config.py).
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+def _find_repo_root() -> Path:
+    """The directory holding ``configs/data.yaml``.
+
+    ``$BRATS_REPO_ROOT`` wins. Otherwise search upward from this file, which works for the
+    source checkout (``<root>/src/brats/config.py``), the Docker image (``/app/src/...``)
+    and a Snowflake ML-Job payload where ``brats/`` sits directly beside ``configs/``.
+    A bare ``parents[2]`` only worked for the first two.
+    """
+    env = os.environ.get("BRATS_REPO_ROOT")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "configs" / "data.yaml").is_file():
+            return parent
+    return here.parents[2]
+
+
+#: Repository root; see :func:`_find_repo_root`.
+REPO_ROOT = _find_repo_root()
 
 DEFAULT_DATA_CONFIG = REPO_ROOT / "configs" / "data.yaml"
 

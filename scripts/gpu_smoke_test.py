@@ -37,7 +37,9 @@ def main():
     print(f"cpu count            : {os.cpu_count()}  (expected 44)")
 
     # One cached case: shape, dtype, and the label invariant.
-    hits = sorted(glob.glob("/mnt/data/cache/**/*.npz", recursive=True))
+    # Cache layout: <mount>/<cohort>/<case_id>.npz (see spcs/service_spec.yaml).
+    root = os.environ.get("BRATS_CACHE_ROOT", "/mnt/data")
+    hits = sorted(glob.glob(f"{root}/**/*.npz", recursive=True))
     print(f"cached npz visible   : {len(hits)}")
     if hits:
         with np.load(hits[0]) as z:

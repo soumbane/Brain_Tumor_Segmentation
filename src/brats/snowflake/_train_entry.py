@@ -7,6 +7,13 @@ code path is exercised locally and remotely.
 
 import argparse
 import sys
+from pathlib import Path
+
+# The payload root (the directory that contains the `brats` package) is not on sys.path
+# when this file is run as a script: Python puts the script's own directory there instead.
+_PAYLOAD_ROOT = str(Path(__file__).resolve().parents[2])
+if _PAYLOAD_ROOT not in sys.path:
+    sys.path.insert(0, _PAYLOAD_ROOT)
 
 
 def main():
@@ -17,6 +24,9 @@ def main():
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--stage-uri", default="")
     ap.add_argument("--resume", action="store_true")
+    # submit_job.submit_training always sends this; an entry point that does not declare it
+    # dies at argument parsing before any training starts.
+    ap.add_argument("--wandb-mode", default=None, choices=["online", "offline", "disabled"])
     args = ap.parse_args()
 
     from snowflake.ml.modeling.distributors.pytorch import (
@@ -50,6 +60,8 @@ def main():
             cfg.run_name = args.run_name
         if args.stage_uri:
             cfg.stage_uri = args.stage_uri
+        if args.wandb_mode:
+            cfg.wandb_mode = args.wandb_mode
 
         train(cfg, DataConfig.load(), resume=args.resume)
         if dist.is_initialized():
