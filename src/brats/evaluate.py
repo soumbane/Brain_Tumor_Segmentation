@@ -105,7 +105,7 @@ def evaluate_segmentation(
             regions = postprocess(
                 pred["probs"], cohort=pred["cohort"], cfg=_stage_config(stage, base_cfg)
             )
-            scored = lesionwise_case(gt, regions)
+            scored = lesionwise_case(gt, regions, cohort=pred["cohort"])
             for region, res in scored.items():
                 rows.append(
                     {
