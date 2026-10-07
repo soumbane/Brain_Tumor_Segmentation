@@ -2,7 +2,8 @@
 
     L_total = L_seg + lambda * L_cls
 
-``L_seg`` -- Dice + CE on 3 nested sigmoid channels, summed over deep-supervision
+``L_seg`` -- Dice + binary CE (per-channel sigmoid; see :class:`SegLoss` for why MONAI's
+``DiceCELoss`` is not used) on 3 nested channels, summed over deep-supervision
 levels with ``1/2^i`` weights. Both Dice+CE and Dice+Focal podiumed in BraTS 2023
 with no clear winner (NVAUTO and BiomedMBZ used Dice+Focal; CNMC/nnU-Net used
 Dice+CE), so both are available. **Batch Dice** rather than per-sample Dice: the
@@ -62,15 +63,30 @@ def deep_supervision_weights(n_levels: int, device=None) -> Tensor:
 
 
 class SegLoss(nn.Module):
-    """Dice + (CE | Focal) over 3 nested sigmoid channels, with deep supervision.
+    """Dice + (BCE | Focal) over 3 nested sigmoid channels, with deep supervision.
+
+    Every term is **per-channel sigmoid**: ET, TC and WT are nested, overlapping regions,
+    so each is an independent binary problem and a voxel can belong to all three.
+
+    Do not replace the BCE term with MONAI's ``DiceCELoss``. With more than one output
+    channel it applies ``nn.CrossEntropyLoss`` -- a *softmax across the channels* -- to
+    the float target. For nested regions that is wrong in three ways: a background voxel
+    (target ``[0,0,0]``) contributes exactly zero loss, so false positives are never
+    penalised by that term; a voxel inside ET (target ``[1,1,1]``) is asked to share one
+    unit of probability mass across three channels; and the loss is invariant to a common
+    shift of the logits, so it does not constrain their scale. (``DiceFocalLoss`` is
+    unaffected: its focal term is sigmoid-based.)
+
+    The loss is computed in float32 regardless of the autocast dtype. Dice sums over
+    ~2M voxels, and bf16 keeps only ~3 significant digits of such a sum.
 
     Args:
-        kind: ``"dice_ce"`` or ``"dice_focal"``.
+        kind: ``"dice_ce"`` (Dice + binary cross-entropy) or ``"dice_focal"``.
         batch_dice: Aggregate Dice over the whole batch instead of per sample.
             Stabilizes cases with an empty region -- with per-sample Dice, an empty
             GT channel gives a near-constant loss and a useless gradient.
-        include_background: Always False here; there is no background channel, the
-            3 outputs are independent nested foreground regions.
+        include_background: Always True here, i.e. every channel is scored; there is no
+            background channel, the 3 outputs are independent foreground regions.
     """
 
     def __init__(
@@ -84,24 +100,43 @@ class SegLoss(nn.Module):
         focal_gamma: float = 2.0,
     ) -> None:
         super().__init__()
-        from monai.losses import DiceCELoss, DiceFocalLoss
+        from monai.losses import DiceFocalLoss, DiceLoss
 
-        common = dict(
-            include_background=True,  # all 3 channels are foreground regions
-            sigmoid=True,             # nested regions -> sigmoid, never softmax
-            to_onehot_y=False,        # targets are already 3 binary channels
-            batch=batch_dice,
-            smooth_nr=smooth_nr,
-            smooth_dr=smooth_dr,
-            lambda_dice=lambda_dice,
-        )
         if kind == "dice_ce":
-            self.loss = DiceCELoss(**common, lambda_ce=lambda_ce)
+            self.dice = DiceLoss(
+                include_background=True,  # all 3 channels are foreground regions
+                sigmoid=True,             # nested regions -> sigmoid, never softmax
+                to_onehot_y=False,        # targets are already 3 binary channels
+                batch=batch_dice,
+                smooth_nr=smooth_nr,
+                smooth_dr=smooth_dr,
+            )
+            self.loss = None
         elif kind == "dice_focal":
-            self.loss = DiceFocalLoss(**common, lambda_focal=lambda_ce, gamma=focal_gamma)
+            self.dice = None
+            self.loss = DiceFocalLoss(
+                include_background=True,
+                sigmoid=True,
+                to_onehot_y=False,
+                batch=batch_dice,
+                smooth_nr=smooth_nr,
+                smooth_dr=smooth_dr,
+                lambda_dice=lambda_dice,
+                lambda_focal=lambda_ce,
+                gamma=focal_gamma,
+            )
         else:
             raise ValueError(f"unknown seg loss kind: {kind!r}")
         self.kind = kind
+        self.lambda_dice = float(lambda_dice)
+        self.lambda_ce = float(lambda_ce)
+
+    def _single(self, logits: Tensor, target: Tensor) -> Tensor:
+        logits, target = logits.float(), target.float()
+        if self.kind == "dice_focal":
+            return self.loss(logits, target)
+        bce = F.binary_cross_entropy_with_logits(logits, target)
+        return self.lambda_dice * self.dice(logits, target) + self.lambda_ce * bce
 
     def forward(self, logits: Tensor | Sequence[Tensor], target: Tensor) -> Tensor:
         """
@@ -111,10 +146,10 @@ class SegLoss(nn.Module):
             target: (B,3,D,H,W) binary targets in (ET, TC, WT) order.
         """
         if isinstance(logits, Tensor):
-            return self.loss(logits, target)
+            return self._single(logits, target)
 
         weights = deep_supervision_weights(len(logits), device=target.device)
-        total = logits[0].new_zeros(())
+        total = logits[0].new_zeros((), dtype=torch.float32)
         for w, lg in zip(weights, logits, strict=True):
             if lg.shape[2:] != target.shape[2:]:
                 # Nearest-neighbour downsampling keeps the targets binary; any
@@ -122,7 +157,7 @@ class SegLoss(nn.Module):
                 tgt = F.interpolate(target.float(), size=lg.shape[2:], mode="nearest")
             else:
                 tgt = target.float()
-            total = total + w * self.loss(lg, tgt)
+            total = total + w * self._single(lg, tgt)
         return total
 
 
