@@ -317,11 +317,16 @@ def summarize(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     out.append("=" * 72)
 
     out.append("\n-- Case counts ------------------------------------------------")
-    counts = df.groupby(["cohort", "split_source"]).size().unstack(fill_value=0)
+    # Reindex so a missing cohort or archive reads as "0 cases" and fails the gate with a
+    # message, instead of raising a KeyError on a partial extraction.
+    counts = (
+        df.groupby(["cohort", "split_source"]).size().unstack(fill_value=0)
+        .reindex(index=list(COHORTS), columns=["train", "val"], fill_value=0)
+    )
     out.append(counts.to_string())
     for cohort in COHORTS:
         for src, table in (("train", EXPECTED_TRAIN_COUNTS), ("val", EXPECTED_VAL_COUNTS)):
-            got = int(counts.loc[cohort, src]) if cohort in counts.index else 0
+            got = int(counts.loc[cohort, src])
             if got != table[cohort]:
                 hard.append(f"{cohort}/{src}: {got} cases, expected {table[cohort]}")
 

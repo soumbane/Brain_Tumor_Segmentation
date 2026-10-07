@@ -117,7 +117,8 @@ def extract_one(
         for i, member in enumerate(members, 1):
             # Guard against path traversal in the archive.
             target = (dest / member.filename).resolve()
-            if not str(target).startswith(str(dest.resolve())):
+            # Path-aware, not a string prefix: '<dest>2/x' starts with '<dest>' as a string.
+            if not target.is_relative_to(dest.resolve()):
                 raise SystemExit(f"Unsafe path in archive: {member.filename}")
             zf.extract(member, dest)
             if i % 2000 == 0 or i == total:
