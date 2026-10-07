@@ -86,6 +86,11 @@ class TrainConfig:
     optimizer: str = "adamw"  # "adamw" | "sgd"
     momentum: float = 0.99  # SGD/nnU-Net lineage only
     grad_clip: float = 12.0
+    #: Abort after this many *consecutive* optimizer steps whose gradient is NaN/Inf
+    #: (bf16/fp32 only; fp16 loss scaling produces such steps by design). Each is
+    #: skipped and logged, so one bad batch cannot destroy the weights, but a run that
+    #: keeps producing them is dead and should stop rather than burn GPU hours.
+    max_nonfinite_steps: int = 20
 
     seg_loss: str = "dice_ce"  # "dice_ce" | "dice_focal"
     lambda_cls: float = 0.1  # set 0.0 for the required ablation
@@ -451,6 +456,65 @@ def validate(
 # ---------------------------------------------------------------------------
 
 
+def sync_grads(params) -> None:
+    """Average gradients of parameters that DDP does not manage, across ranks.
+
+    ``DDP`` only synchronises the wrapped model. Parameters owned by the loss module
+    (the uncertainty-weighting log-variances) get a gradient from each rank's *local*
+    batch, so without this the ranks drift apart -- and, because they all enter the
+    clipping norm, so does the clip coefficient applied to the (synchronised) model.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    world = dist.get_world_size()
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)  # every rank must join the collective
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        p.grad.div_(world)
+
+
+def optimizer_step(
+    loss: Tensor,
+    params: list[nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+    scaler: Any,
+    grad_clip: float,
+    unmanaged: list[nn.Parameter] | tuple = (),
+) -> tuple[float, bool]:
+    """Backward, clip, and step -- refusing to apply a non-finite gradient.
+
+    ``clip_grad_norm_`` multiplies every gradient by ``clip / (norm + eps)``; if the norm
+    is NaN so is every gradient, and one optimizer step turns every weight into NaN.
+    This was the failure mode of the bf16 attention-pooling bug: one bad batch silently
+    destroyed the model. A non-finite norm now skips the update instead.
+
+    Under DDP the norm is computed on already-synchronised gradients, so every rank
+    reaches the same verdict and skips together.
+
+    Returns:
+        ``(grad_norm, stepped)``. With an fp16 ``GradScaler`` the scaler owns skipping
+        (non-finite steps are expected while it calibrates) and ``stepped`` only reports
+        whether the norm was finite.
+    """
+    if scaler.is_enabled():
+        scaler.scale(loss).backward()
+        sync_grads(unmanaged)
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        return float(norm), bool(torch.isfinite(norm))
+
+    loss.backward()
+    sync_grads(unmanaged)
+    norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
+    if not bool(torch.isfinite(norm)):
+        return float(norm), False
+    optimizer.step()
+    return float(norm), True
+
+
 def build_scheduler(optimizer, cfg: TrainConfig, steps_per_epoch: int):
     """Linear warmup then cosine annealing to zero, stepped per iteration."""
     from torch.optim.lr_scheduler import LambdaLR
@@ -557,6 +621,9 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
     # bf16 needs no GradScaler; fp16 does. Prefer bf16 -- see brats.losses.
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
+    # Loss-module parameters (uncertainty log-variances) sit outside DDP; see sync_grads.
+    unmanaged = list(loss_module.parameters())
+
     for epoch in range(start_epoch, cfg.epochs):
         model.train()
         net = model.module if isinstance(model, DDP) else model
@@ -567,6 +634,9 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
         t0 = time.time()
         running = {"total": 0.0, "seg": 0.0, "cls": 0.0}
         n_steps = 0
+        n_ok = 0           # steps whose update was applied (and enter the epoch mean)
+        n_skipped = 0      # steps skipped for a non-finite gradient
+        consecutive_bad = 0
         global_step = epoch * len(train_loader)
 
         for batch in train_loader:
@@ -584,21 +654,36 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
                 losses = loss_module(out["seg"], label, out["cls"], cohort)
 
             loss = losses["total"]
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-                optimizer.step()
+            _, stepped = optimizer_step(
+                loss, params, optimizer, scaler, cfg.grad_clip, unmanaged=unmanaged,
+            )
             scheduler.step()
-
-            for k in running:
-                running[k] += float(losses[k].detach())
             n_steps += 1
+
+            if stepped:
+                consecutive_bad = 0
+                for k in running:
+                    running[k] += float(losses[k].detach())
+                n_ok += 1
+            elif not scaler.is_enabled():
+                consecutive_bad += 1
+                n_skipped += 1
+                if is_main(rank):
+                    log.warning(
+                        "non-finite gradient at epoch %d step %d -- update SKIPPED "
+                        "(loss %.4g seg %.4g cls %.4g, cases %s)",
+                        epoch + 1, n_steps, float(losses["total"].detach()),
+                        float(losses["seg"]), float(losses["cls"]),
+                        batch.get("case_id"),
+                    )
+                if consecutive_bad >= cfg.max_nonfinite_steps:
+                    # Same verdict on every rank (the norm is synchronised), so all
+                    # raise together. last.pt from the previous epoch stays intact.
+                    raise RuntimeError(
+                        f"{consecutive_bad} consecutive non-finite gradient steps at "
+                        f"epoch {epoch + 1}; aborting. Resume from the last checkpoint "
+                        "after fixing the cause."
+                    )
 
             # Per-step logging on rank 0. Every 20 steps keeps the curve readable
             # without flooding the run; LR matters because batch 8 is off-literature
@@ -617,7 +702,7 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
                 )
 
         for k in running:
-            running[k] = all_reduce_mean(running[k] / max(n_steps, 1), device)
+            running[k] = all_reduce_mean(running[k] / max(n_ok, 1), device)
 
         if is_main(rank):
             log.info(
@@ -625,10 +710,16 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
                 epoch + 1, cfg.epochs, running["total"], running["seg"], running["cls"],
                 scheduler.get_last_lr()[0], alpha, time.time() - t0,
             )
+            if n_skipped:
+                log.warning(
+                    "  %d/%d steps this epoch were skipped for a non-finite gradient",
+                    n_skipped, n_steps,
+                )
 
         # Validation and checkpointing on rank 0 only.
         do_val = ((epoch + 1) % cfg.val_every == 0) or (epoch + 1 == cfg.epochs)
         metrics = dict(running)
+        metrics["skipped_steps"] = n_skipped
         if do_val and is_main(rank):
             metrics.update(validate(model, val_loader, device, cfg))
             log.info(
