@@ -8,7 +8,7 @@ needing a 96 GB card. 44 vCPU / 4 ranks leaves ~11 vCPU per rank, enough to keep
 
 A10G is Ampere (sm_86), so **bf16 is native**: no ``GradScaler``, and far more
 forgiving for Dice-family losses whose small denominators are a known fp16 NaN
-source. NCCL over PCIe (no NVLink) is fine for a ~30M-parameter model.
+source. NCCL over PCIe (no NVLink) is fine for a ~20M-parameter model.
 
 Batch 8 is off-literature. Every published BraTS recipe used batch 1-5 under 16-48 GB
 limits, so **the literature's LR does not transfer** -- treat LR as an early sweep
@@ -39,6 +39,7 @@ import random
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +139,10 @@ class TrainConfig:
         raw = load_yaml(path)
         tr = raw.get("train", raw)
         known = {f for f in cls.__dataclass_fields__}
+        unknown = sorted(set(tr) - known)
+        if unknown:
+            # Dropping these silently turns a typo (`lamda_cls`) into a default value.
+            log.warning("ignoring unknown keys in %s: %s", path, unknown)
         kwargs = {k: v for k, v in tr.items() if k in known}
         if "patch_size" in kwargs:
             kwargs["patch_size"] = tuple(kwargs["patch_size"])
@@ -162,7 +167,10 @@ def setup_distributed() -> tuple[int, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     backend = "nccl" if torch.cuda.is_available() else "gloo"
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        # Validation and checkpointing run on rank 0 only while the other ranks wait in a
+        # barrier, so the collective timeout must outlast the slowest of them. The default
+        # (10 min for NCCL) is tight for ~60 full-volume sliding-window passes.
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=60))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return rank, local_rank, world_size
@@ -579,8 +587,12 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
         log.info("parameters: %.1fM total, %.1fM trainable", total / 1e6, trainable / 1e6)
 
     if world_size > 1:
-        # SyncBatchNorm: with batch 2/GPU, per-rank BN statistics are too noisy.
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        # SyncBatchNorm: with batch 2/GPU, per-rank BN statistics are too noisy. It is
+        # CUDA-only, so CPU (gloo) debugging runs keep ordinary per-rank BatchNorm.
+        if device.type == "cuda":
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        elif is_main(rank):
+            log.warning("SyncBatchNorm needs CUDA; using per-rank BatchNorm on %s", device.type)
         # When lambda_cls == 0 the classification head still runs in forward (so its
         # loss stays reportable and the ablation stays comparable) but receives no
         # gradient. DDP rejects unused parameters by default and fails on the SECOND
@@ -794,7 +806,7 @@ def train(cfg: TrainConfig, data_cfg: DataConfig, resume: bool = False) -> None:
         dist.destroy_process_group()
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Train the multi-task BraTS model")
     ap.add_argument("--config", default="configs/segresnet_base.yaml")
     ap.add_argument("--data-config", default=None)
@@ -821,7 +833,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--wandb-project", default=None)
     ap.add_argument("--wandb-group", default=None, help="group ablation arms together")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s"
