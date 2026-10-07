@@ -170,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     from brats.data.transforms import CachedBratsDataset, load_records, val_transforms
-    from brats.models.multitask import MultiTaskConfig, build_model
+    from brats.models.multitask import MultiTaskConfig, load_model_from_checkpoint
     from brats.train import CheckpointManager, TrainConfig, train
 
     cfg = TrainConfig.from_yaml(args.config)
@@ -185,13 +185,15 @@ def main(argv: list[str] | None = None) -> int:
     # -- arm A: normal inputs -------------------------------------------
     normal_cfg = replace(cfg, run_name=f"{cfg.run_name}_bin_control_normal")
     if args.normal_checkpoint:
-        model = build_model(MultiTaskConfig(pooling=cfg.pooling)).to(device)  # type: ignore[arg-type]
-        CheckpointManager(normal_cfg).load(model, path=Path(args.normal_checkpoint))
+        normal_ckpt = Path(args.normal_checkpoint)
     else:
         log.info("training arm A (normal inputs), %d epochs", args.epochs)
         train(normal_cfg, data_cfg)
-        model = build_model(MultiTaskConfig(pooling=cfg.pooling)).to(device)  # type: ignore[arg-type]
-        CheckpointManager(normal_cfg).load(model)
+        normal_ckpt = CheckpointManager(normal_cfg).dir / "last.pt"
+    model = load_model_from_checkpoint(
+        normal_ckpt,
+        fallback=MultiTaskConfig(pooling=cfg.pooling),  # type: ignore[arg-type]
+    ).to(device)
     res_normal = evaluate_classification(model, val_ds, device, False, args.limit)
 
     # -- arm B: binarized inputs, matched schedule ----------------------

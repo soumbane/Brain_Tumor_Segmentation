@@ -342,6 +342,10 @@ class CheckpointManager:
             "loss_module": loss_module.state_dict(),
             "metrics": metrics,
             "config": asdict(self.cfg),
+            # The trainer picks `norm` at run time from the effective batch size, so
+            # the architecture must travel with the weights: see
+            # brats.models.multitask.load_model_from_checkpoint.
+            "model_config": asdict(net.cfg),
             "best": self.best,
             "rng": {
                 "torch": torch.get_rng_state(),

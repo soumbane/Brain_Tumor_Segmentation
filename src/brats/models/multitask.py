@@ -24,7 +24,9 @@ Output contract, which the rest of the codebase relies on:
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -222,6 +224,46 @@ class MultiTaskBraTS(nn.Module):
 
 def build_model(cfg: MultiTaskConfig | None = None) -> MultiTaskBraTS:
     return MultiTaskBraTS(cfg)
+
+
+def _infer_norm(model_state: dict[str, Tensor]) -> str:
+    """Recover the norm type from weights alone: batch norm keeps running stats."""
+    return "batch" if any(k.endswith("running_mean") for k in model_state) else "instance"
+
+
+def config_from_checkpoint(
+    state: dict[str, Any], fallback: MultiTaskConfig | None = None
+) -> MultiTaskConfig:
+    """The architecture a checkpoint was trained with.
+
+    ``CheckpointManager`` stores it under ``model_config``. This matters because the
+    trainer chooses ``norm`` at run time (batch norm needs an effective batch >= 4,
+    otherwise instance norm), so rebuilding the model from the YAML alone yields a
+    state dict that cannot be loaded. Checkpoints that predate ``model_config`` start
+    from ``fallback`` and recover ``norm`` from the weights.
+    """
+    saved = state.get("model_config")
+    if saved is not None:
+        known = {f.name for f in dataclasses.fields(MultiTaskConfig)}
+        kwargs = {k: v for k, v in saved.items() if k in known}
+        if "blocks_down" in kwargs:
+            kwargs["blocks_down"] = tuple(kwargs["blocks_down"])
+        return MultiTaskConfig(**kwargs)
+    return dataclasses.replace(
+        fallback or MultiTaskConfig(), norm=_infer_norm(state["model"])
+    )
+
+
+def load_model_from_checkpoint(
+    path: str | Path,
+    fallback: MultiTaskConfig | None = None,
+    map_location: str | torch.device = "cpu",
+) -> MultiTaskBraTS:
+    """Build a model matching a checkpoint's architecture and load its weights."""
+    state = torch.load(path, map_location=map_location, weights_only=False)
+    model = build_model(config_from_checkpoint(state, fallback))
+    model.load_state_dict(state["model"])
+    return model
 
 
 def count_parameters(model: nn.Module) -> tuple[int, int]:
