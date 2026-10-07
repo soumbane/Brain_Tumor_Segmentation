@@ -5,7 +5,10 @@ Preprocessing is deliberately minimal, matching what every BraTS 2023 top team d
 1. **Stack** the 4 sequences in canonical ``(t1n, t1c, t2w, t2f)`` order.
 2. **Crop** to the nonzero brain bounding box plus a margin (~40% volume reduction),
    rounded up to a multiple of ``size_divisor`` so the encoder's downsampling levels
-   and sliding-window inference never meet a ragged edge.
+   and sliding-window inference never meet a ragged edge. Where rounding up overruns
+   the volume (the z axis: 155 -> 160) the box extends past the end and is
+   zero-padded, so ``crop_stop`` can exceed ``orig_shape``. Cropping asserts that no
+   brain or labeled voxel is lost.
 3. **Z-score per channel over nonzero voxels only**, leaving background at exactly 0.
    Normalizing over the whole volume including background is a common and costly
    mistake -- the background dominates the statistics.
@@ -111,35 +114,62 @@ def brain_bbox(
 ) -> tuple[slice, slice, slice]:
     """Bounding box of ``mask``, padded by ``margin`` and rounded up to ``divisor``.
 
-    The box is clamped to the volume, then, if rounding would overflow, shifted back
-    inward so the returned extent is always in-bounds and always a multiple of
-    ``divisor``.
+    The returned extent is always a multiple of ``divisor`` and always contains every
+    voxel of ``mask``. Where the rounded extent fits inside the volume the box is
+    shifted inward to stay in-bounds. Where it does not -- the SRI24 z axis is 155
+    slices, and ``ceil(155 / 16) * 16 = 160`` -- the box starts at 0 and runs *past*
+    the end of the volume, and :func:`crop_pad` fills the overhang with zeros.
+
+    Rounding *down* to fit the volume instead (``155 -> 144``) silently discards the
+    top slices of any brain whose margin-padded extent exceeds 144, taking tumor
+    labels with it.
     """
     slices: list[slice] = []
     for axis in range(3):
+        size = mask.shape[axis]
         others = tuple(a for a in range(3) if a != axis)
         present = np.any(mask, axis=others)
         idx = np.nonzero(present)[0]
         if idx.size == 0:  # empty mask: keep the whole axis
-            lo, hi = 0, mask.shape[axis]
+            lo, hi = 0, size
         else:
             lo = max(0, int(idx[0]) - margin)
-            hi = min(mask.shape[axis], int(idx[-1]) + 1 + margin)
+            hi = min(size, int(idx[-1]) + 1 + margin)
 
         extent = hi - lo
         target = ((extent + divisor - 1) // divisor) * divisor
-        target = min(target, (mask.shape[axis] // divisor) * divisor) or divisor
-        grow = target - extent
-        if grow > 0:
+        if target > size:
+            # Cannot round up inside the volume: pad past the end instead.
+            lo, hi = 0, target
+        else:
+            grow = target - extent
             lo = max(0, lo - grow // 2)
             hi = lo + target
-            if hi > mask.shape[axis]:
-                hi = mask.shape[axis]
-                lo = max(0, hi - target)
-        elif grow < 0:
-            hi = lo + target
+            if hi > size:
+                hi = size
+                lo = hi - target
         slices.append(slice(lo, hi))
     return tuple(slices)  # type: ignore[return-value]
+
+
+def crop_pad(arr: np.ndarray, box: tuple[slice, slice, slice]) -> np.ndarray:
+    """Crop the trailing three axes of ``arr`` to ``box``, zero-filling overhang.
+
+    ``box`` may extend beyond ``arr`` (see :func:`brain_bbox`); those voxels are 0,
+    which is the background code for images and the background label for segmentations.
+    """
+    spatial = arr.shape[-3:]
+    out = np.zeros(
+        (*arr.shape[:-3], *(s.stop - s.start for s in box)), dtype=arr.dtype
+    )
+    src = tuple(
+        slice(max(s.start, 0), min(s.stop, n)) for s, n in zip(box, spatial, strict=True)
+    )
+    dst = tuple(
+        slice(a.start - s.start, a.stop - s.start) for a, s in zip(src, box, strict=True)
+    )
+    out[(..., *dst)] = arr[(..., *src)]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +226,25 @@ def preprocess_case(
 
     # ---- crop ----------------------------------------------------------
     box = brain_bbox(mask, margin=margin, divisor=divisor)
-    img4 = img4[(slice(None), *box)]
-    mask_c = mask[box]
+    n_brain = int(mask.sum())
+    n_fg = int((seg > 0).sum()) if seg is not None else 0
+    img4 = crop_pad(img4, box)
+    mask_c = crop_pad(mask, box)
     if seg is not None:
-        seg = seg[box]
+        seg = crop_pad(seg, box)
+    # Cropping must be lossless for everything that is not background. A box that
+    # clips brain or tumor would otherwise surface nowhere downstream: the cached
+    # image and label are cut identically, and evaluation scores in cropped space.
+    if int(mask_c.sum()) != n_brain:
+        raise ValueError(
+            f"{case_id}: crop dropped {n_brain - int(mask_c.sum())} brain voxels "
+            f"(box {box})"
+        )
+    if seg is not None and int((seg > 0).sum()) != n_fg:
+        raise ValueError(
+            f"{case_id}: crop dropped {n_fg - int((seg > 0).sum())} labeled voxels "
+            f"(box {box})"
+        )
 
     # ---- per-channel z-score over nonzero voxels only ------------------
     codes = np.empty(img4.shape, dtype=np.uint8)
@@ -270,26 +315,40 @@ def verify_roundtrip(npz_path: Path, row: dict) -> dict:
     )
 
     worst_z = 0.0
+    full_mask: np.ndarray | None = None
     for c, suf in enumerate(SEQUENCES):
-        orig = np.asanyarray(nib.load(row[f"path_{suf}"]).dataobj).astype(np.float32)[box]
+        orig_full = np.asanyarray(nib.load(row[f"path_{suf}"]).dataobj).astype(np.float32)
+        nz = orig_full != 0
+        full_mask = nz if full_mask is None else (full_mask | nz)
+        orig = crop_pad(orig_full, box)
         mean, std = float(stats[c, 0]), float(stats[c, 1])
         expect = np.clip((orig - mean) / std, -QUANT_CLIP_SIGMA, QUANT_CLIP_SIGMA)
         expect = np.where(mask, expect, 0.0)
         got = dequantize(codes[c])
         worst_z = max(worst_z, float(np.abs(got - expect).max()))
 
+    # Comparing the cache with a crop of the source cannot reveal a crop that is too
+    # small, so also compare foreground counts against the *uncropped* source.
+    assert full_mask is not None
+    crop_lossless = int(full_mask.sum()) == int(mask.sum())
+
     seg_ok = None
     if cached_seg is not None and row.get("path_seg"):
-        orig_seg = np.rint(
+        orig_seg_full = np.rint(
             np.asanyarray(nib.load(row["path_seg"]).dataobj)
-        ).astype(np.uint8)[box]
-        seg_ok = bool((orig_seg == cached_seg).all())
+        ).astype(np.uint8)
+        orig_seg = crop_pad(orig_seg_full, box)
+        seg_ok = bool(
+            (orig_seg == cached_seg).all()
+            and int((orig_seg_full > 0).sum()) == int((cached_seg > 0).sum())
+        )
 
     return {
         "case_id": row["case_id"],
         "max_abs_z_error": worst_z,
         "within_quant_step": worst_z <= quant_scale() * 0.51,
         "mask_consistent": mask_consistent,
+        "crop_lossless": crop_lossless,
         "seg_lossless": seg_ok,
         "mb": npz_path.stat().st_size / 1e6,
     }
@@ -402,6 +461,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if not bool(vdf["mask_consistent"].all()):
             print("VERIFICATION FAILED: brain mask differs between channels")
+            return 1
+        if not bool(vdf["crop_lossless"].all()):
+            print(
+                "VERIFICATION FAILED: the crop dropped brain voxels. This cache was "
+                "written before the z-axis fix; re-run with --overwrite."
+            )
             return 1
         if (vdf["seg_lossless"].dropna() == False).any():  # noqa: E712
             print("VERIFICATION FAILED: segmentation labels not preserved exactly")

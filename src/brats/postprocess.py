@@ -298,13 +298,20 @@ def paste_into_original(
     """Place a cropped prediction back into the original 240x240x155 grid.
 
     Predictions must be submitted and scored in the original geometry; the crop was
-    a training-time convenience only.
+    a training-time convenience only. The crop box may extend past the end of the
+    volume (the z axis is zero-padded 155 -> 160 during preprocessing), so the
+    overhang of ``volume`` is discarded here.
     """
-    out = np.zeros(tuple(int(s) for s in orig_shape), dtype=volume.dtype)
-    box = tuple(
-        slice(int(a), int(b)) for a, b in zip(crop_start, crop_stop, strict=True)
-    )
-    out[box] = volume
+    shape = tuple(int(s) for s in orig_shape)
+    out = np.zeros(shape, dtype=volume.dtype)
+    dst: list[slice] = []
+    src: list[slice] = []
+    for a, b, n in zip(crop_start, crop_stop, shape, strict=True):
+        a, b = int(a), int(b)
+        lo, hi = max(a, 0), min(b, n)
+        dst.append(slice(lo, hi))
+        src.append(slice(lo - a, hi - a))
+    out[tuple(dst)] = volume[tuple(src)]
     return out
 
 
