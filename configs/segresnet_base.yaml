@@ -1,24 +1,23 @@
-# Baseline recipe: SegResNetDS multi-task, GPU_NV_M (4x A10G 24GB).
+# Baseline recipe: SegResNetDS multi-task, Databricks Serverless GPU (1x H100 80GB).
 #
-# Synthesized from the BraTS 2023 winners and adapted to 24 GB per GPU.
-# Batch 2/GPU x 4 ranks = effective batch 8.
+# Synthesized from the BraTS 2023 winners. Single-GPU, no DDP.
+# Batch 4 on 80 GB VRAM; effective batch 4.
 #
 # WARNING on learning rate: every published BraTS recipe used batch 1-5 under
-# 16-48 GB VRAM limits. Nobody tuned these LR/schedule values at batch 8, so LR is
-# an early sweep target, not a settled value.
+# 16-48 GB VRAM limits. LR is an early sweep target, not a settled value.
 
 train:
   run_name: segresnet_base
 
   # -- geometry / throughput ------------------------------------------------
   patch_size: [128, 128, 128]   # CNMC (PED), BiomedMBZ
-  batch_size_per_gpu: 2         # 4 ranks -> effective 8
-  num_workers: 8                # 44 vCPU / 4 ranks ~= 11; augmentation is CPU-bound
+  batch_size_per_gpu: 4         # single H100 80GB; effective batch 4
+  num_workers: 0                # debug: rule out FUSE/multiprocessing NaN issue
   amp_dtype: bfloat16           # A10G is Ampere; bf16 needs no GradScaler
 
   # -- schedule -------------------------------------------------------------
-  epochs: 150                   # 50 smoke -> 150 dev -> 600 final
-  warmup_epochs: 8              # NVAUTO; then cosine anneal to zero
+  epochs: 50                    # initial trial run on Databricks
+  warmup_epochs: 4              # proportional to 50 epochs; cosine anneal to zero
   lr: 2.0e-4                    # AdamW, NVAUTO/SegResNet lineage. SWEEP THIS.
   weight_decay: 1.0e-5
   optimizer: adamw              # alt: sgd (nnU-Net lineage, lr 0.01 mom 0.99)
@@ -33,8 +32,12 @@ train:
 
   # -- classification head --------------------------------------------------
   pooling: tumor_attention      # alt: gap (confound ablation), tafe (upgrade)
-  cls_warmup_epochs: 20         # GT-mask teacher forcing, annealed to prediction
+  cls_warmup_epochs: 10         # proportional to 50 epochs; GT-mask teacher forcing
   cohort_balanced_sampling: true
+
+  # -- experiment tracking (MLflow / Databricks) ----------------------------
+  use_mlflow: true            # logs to Databricks MLflow automatically
+  mlflow_experiment: ''       # empty = notebook default experiment
 
   # -- validation / checkpointing -------------------------------------------
   val_every: 5
@@ -47,7 +50,7 @@ train:
   stage_uri: ''                 # e.g. '@BRATS_MRI.CORE.CKPT'
 
   # -- experiment tracking (Weights & Biases) --------------------------------
-  wandb: true
+  wandb: false                  # disabled for Databricks trial; enable after setup
   wandb_project: brats2023
   wandb_entity: ''              # your W&B team/username; blank = default
   wandb_group: ''               # set to group ablation arms, e.g. 'lambda-sweep'

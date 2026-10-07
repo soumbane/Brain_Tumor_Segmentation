@@ -110,7 +110,9 @@ class TrainConfig:
     #: Empty disables staging (local runs).
     stage_uri: str = ""
 
-    # -- experiment tracking (Weights & Biases) ---------------------------
+    # -- experiment tracking ------------------------------------------------
+    use_mlflow: bool = False  # Databricks native tracking
+    mlflow_experiment: str = ""  # MLflow experiment name; empty = default
     wandb: bool = False
     wandb_project: str = "brats2023"
     wandb_entity: str = ""

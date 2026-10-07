@@ -1,23 +1,22 @@
-"""Weights & Biases experiment tracking.
+"""Experiment tracking: MLflow (Databricks) and Weights & Biases.
 
-Wrapped rather than called inline for three reasons that matter on SPCS:
+Wrapped rather than called inline for three reasons:
 
 1. **Rank discipline.** Only rank 0 may log. Four ranks logging to one run produces
    interleaved, unusable curves; four separate runs is worse.
 2. **Never kill a training run.** A network blip, an expired key, or a missing
-   external access integration must degrade to a no-op, not crash a job that has been
-   burning A10G credits for hours. Every call here is failure-tolerant.
-3. **Offline by default on SPCS.** W&B needs egress to ``api.wandb.ai``, which
-   requires an external access integration. Without one, ``WANDB_MODE=offline``
-   writes run data to disk for later ``wandb sync``. That is the safe default in a
-   container, so it is opt-in to go online.
+   integration must degrade to a no-op, not crash a job that has been
+   burning GPU credits for hours. Every call here is failure-tolerant.
+3. **Platform flexibility.** On Databricks, MLflow is the native tracker and is
+   pre-configured. On Snowflake/SPCS, W&B in offline mode is used instead.
 
 Enable in ``configs/segresnet_base.yaml``::
 
     train:
-      wandb: true
+      use_mlflow: true          # Databricks native tracking
+      wandb: true               # W&B tracking (can coexist with mlflow)
       wandb_project: brats2023
-      wandb_mode: offline      # online | offline | disabled
+      wandb_mode: offline       # online | offline | disabled
 """
 
 from __future__ import annotations
@@ -190,8 +189,132 @@ class WandbLogger:
         self.finish()
 
 
-def build_logger(cfg, is_rank_zero: bool = True) -> WandbLogger:
-    """Construct a :class:`WandbLogger` from a ``TrainConfig``."""
+class MLflowLogger:
+    """MLflow tracker for Databricks. Same interface as WandbLogger."""
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        run_name: str | None = None,
+        config: Any = None,
+        experiment_name: str | None = None,
+        is_rank_zero: bool = True,
+    ) -> None:
+        self.enabled = bool(enabled) and is_rank_zero
+        self._run = None
+        self._warned = False
+
+        if not self.enabled:
+            return
+
+        try:
+            import mlflow
+            self._mlflow = mlflow
+        except ImportError:
+            log.warning("mlflow not installed; continuing without tracking.")
+            self.enabled = False
+            return
+
+        try:
+            # Resolve experiment: explicit arg > env var > default path.
+            exp = experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME")
+            if exp:
+                mlflow.set_experiment(exp)
+
+            cfg_dict = asdict(config) if is_dataclass(config) else (config or {})
+            # MLflow params must be strings; flatten complex types.
+            params = {}
+            for k, v in cfg_dict.items():
+                if isinstance(v, (dict, list, tuple)):
+                    params[k] = str(v)
+                else:
+                    params[k] = v
+
+            self._run = mlflow.start_run(run_name=run_name)
+            mlflow.log_params(params)
+            log.info("mlflow run %r started (run_id=%s)", run_name, self._run.info.run_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mlflow init failed (%s); continuing without tracking", exc)
+            self.enabled = False
+            self._run = None
+
+    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
+        if not self.enabled or self._run is None:
+            return
+        try:
+            clean = {
+                k: v
+                for k, v in metrics.items()
+                if isinstance(v, (int, float)) and v == v  # drop NaN
+            }
+            if clean:
+                self._mlflow.log_metrics(clean, step=step)
+        except Exception as exc:  # noqa: BLE001
+            if not self._warned:
+                log.warning("mlflow logging failed (%s); further errors suppressed", exc)
+                self._warned = True
+
+    def log_config_update(self, updates: dict[str, Any]) -> None:
+        if not self.enabled or self._run is None:
+            return
+        try:
+            params = {k: str(v) if isinstance(v, (dict, list, tuple)) else v
+                      for k, v in updates.items()}
+            self._mlflow.log_params(params)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def watch(self, model, log_freq: int = 500) -> None:
+        # MLflow does not have gradient watching; no-op.
+        pass
+
+    def log_artifact(self, path: str | Path, name: str, type_: str = "model") -> None:
+        if not self.enabled or self._run is None:
+            return
+        try:
+            self._mlflow.log_artifact(str(path))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mlflow artifact upload failed (%s)", exc)
+
+    def summary(self, key: str, value: Any) -> None:
+        if not self.enabled or self._run is None:
+            return
+        try:
+            self._mlflow.log_metrics({key: value})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def finish(self) -> None:
+        if not self.enabled or self._run is None:
+            return
+        try:
+            self._mlflow.end_run()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._run = None
+
+    def __enter__(self) -> "MLflowLogger":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.finish()
+
+
+def build_logger(cfg, is_rank_zero: bool = True) -> WandbLogger | MLflowLogger:
+    """Construct the appropriate tracker from a ``TrainConfig``.
+
+    Returns an :class:`MLflowLogger` when ``use_mlflow`` is set (Databricks),
+    otherwise falls back to :class:`WandbLogger`.
+    """
+    if getattr(cfg, "use_mlflow", False):
+        return MLflowLogger(
+            enabled=True,
+            run_name=cfg.run_name,
+            config=cfg,
+            experiment_name=getattr(cfg, "mlflow_experiment", None) or None,
+            is_rank_zero=is_rank_zero,
+        )
     return WandbLogger(
         enabled=getattr(cfg, "wandb", False),
         project=getattr(cfg, "wandb_project", "brats2023"),
@@ -221,4 +344,4 @@ def _auto_tags(cfg) -> list[str]:
     return tags
 
 
-__all__ = ["WandbLogger", "build_logger"]
+__all__ = ["WandbLogger", "MLflowLogger", "build_logger"]
