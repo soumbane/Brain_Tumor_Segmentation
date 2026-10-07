@@ -102,6 +102,40 @@ that constraint is why the cache is uint8 and not float16 (which would need ~110
 
 ---
 
+## 3b. Run on Databricks (current target) or any Linux GPU host
+
+The training code is platform-neutral: paths come from environment variables, there is no
+Snowflake call unless `stage_uri` is set, and the same entry point serves one GPU or many.
+
+```bash
+pip install -r requirements.txt            # torch+CUDA first if the runtime lacks it (see the file header)
+export BRATS_CACHE_ROOT=/Volumes/imaging_research/brain_tumor_segmentation/brats_dataset   # .npz cache: <root>/{GLI,MEN,PED}/<case>.npz
+export BRATS_SPLITS_CSV=$PWD/splits/split_random_seed42.csv                                # or leave unset: repo copy is used
+export BRATS_CKPT_ROOT=/Volumes/imaging_research/brain_tumor_segmentation/checkpoints     # per-epoch checkpoints; resume reads here
+
+# one GPU
+python -m brats.train --config configs/segresnet_base.yaml --epochs 150 --run-name base --no-wandb --resume
+
+# N GPUs on one node (NCCL; SyncBatchNorm is enabled automatically)
+torchrun --nproc_per_node=4 -m brats.train --config configs/segresnet_base.yaml --epochs 150 --run-name base --resume
+```
+
+Things that behave differently from what you might assume:
+
+* **Batch norm vs instance norm is chosen at run time**: `batch_size_per_gpu × GPUs >= 4` gives batch norm,
+  otherwise instance norm. Checkpoints record which (`model_config`), and `evaluate`/`qc` rebuild the model
+  from it, so a one-GPU checkpoint evaluates correctly.
+* **Cohort balance**: single process → a weighted sampler *and* an unweighted CE loss; DDP → the
+  `cohort_balanced_sampling` flag is ignored and the class-weighted CE carries the balance (a warning says so).
+* **Non-finite gradients are skipped**, not applied: the step is logged with the offending case ids and the epoch
+  log reports `skipped_steps`. After `max_nonfinite_steps` (default 20) consecutive skips the run aborts and
+  `last.pt` from the previous epoch is intact. If you ever see this, it is a bug to report, not noise.
+* `data.yaml` still lists Windows paths for archives/extraction and the Databricks Volume for `cache_root`;
+  the env vars above override it per run. `preprocess` needs the raw NIfTI and manifest, so run it where the
+  data was extracted and copy the finished `.npz` cache to the Volume.
+* If a cache was written before the z-axis crop fix, re-run `python -m brats.data.preprocess --overwrite --verify`
+  (brains spanning more than 144 slices were silently clipped).
+
 ## 4. Stage to Snowflake *(needs the admin grants)*
 
 ```powershell
@@ -186,7 +220,7 @@ Local single-GPU or CPU debugging of the same code path:
 
 ## 7. Post-processing — the highest-return stage
 
-Tune `configs/postproc.yaml` on **validation only**.
+Tune `configs/postproc.yaml` on **validation only**. It is read by `evaluate` and `qc` (`--postproc-config` to use another file, `--tta` to override the YAML); the settings used are written to `postprocess_config.json` next to the results. Unknown keys fail loudly.
 
 ```powershell
 .venv\Scripts\python.exe -m brats.evaluate --split val --checkpoint <ckpt> --tta none
@@ -204,6 +238,13 @@ Two traps, both encoded in the code and configs:
 TTA is a sweep, not an assumption: the published evidence is genuinely split.
 
 ---
+
+### Leaderboard-comparable numbers
+
+`evaluate` uses the in-repo lesion-wise implementation, which reproduces the official one (verify it yourself:
+`git clone https://github.com/rachitsaluja/BraTS-2023-Metrics.git external/brats_metrics`, then
+`python -c "from brats.metrics.lesionwise import verify_against_official as v; r = v(); print({k: x for k, x in r.items() if k != 'rows'})"`). For a number you will
+publish, score exported label maps with `brats.metrics.lesionwise.score_with_official(pred_dir, gt_dir, out_csv)`.
 
 ## 8. Confound diagnostics
 
@@ -253,7 +294,9 @@ number** — n≈10 there, and differences under 0.05 Dice are noise.
 | 1b. Manifest | **done, PASSED** — 0 label-4s, labels exactly {0,1,2,3}, 0 integrity errors |
 | 1c. Splits | **done, committed** — `splits/split_random_seed42.csv`, 0 patient leakage |
 | 2. Confound pre-screen | **done** — mask geometry alone reaches 0.769 balanced acc (chance 0.333) |
-| 3. Preprocess cache | **NOT RUN** — required before training can start |
+| 3. Preprocess cache | **NOT RUN here** — re-run with `--overwrite --verify` if built before the z-crop fix |
+| 6. Train / 7. Evaluate | code complete and unit-tested (174 tests, CPU); **not run on a GPU or on real data** |
+| Lesion-wise metric | matches the official implementation exactly (Dice, TP/FP/FN); HD95 within ~0.5 mm — `verify_against_official()` |
 | 4–9 | not run (4+ blocked on grants) |
 
-All scripts are written and statically verified. Resume at step **3**.
+All scripts are written and unit-tested (`pytest`). Resume at step **3**. The pre-screen numbers above were produced with a patient-leaky CV and should be re-run (`python -m brats.confound.probes --max-cases 300`).

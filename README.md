@@ -4,7 +4,13 @@ Multi-task 3D deep learning on the ASNR-MICCAI BraTS 2023 challenge data: voxel-
 segmentation of tumor sub-regions across three cohorts (adult glioma, meningioma,
 pediatric glioma) plus a volume-level 3-class cohort classifier sharing the same encoder.
 
-**Status:** planning complete, no implementation yet. This document is the plan of record.
+**Status:** the pipeline is implemented end to end (data → train → inference → post-processing →
+lesion-wise evaluation → confound diagnostics) but **no model has been trained to completion yet**.
+This document is the original plan and design rationale; where the code disagrees, the code wins.
+See `RUNBOOK.md` for the commands and the current state of each step. Known deviations from this
+plan: the classification-confound pre-screen was run, preprocessing/training/evaluation are written
+and unit-tested but not yet run on real data, and Swin UNETR, the site-held-out split and the LRP
+relevance maps are not implemented.
 
 ---
 
@@ -646,7 +652,7 @@ constraints (§7.3).
 ### 10.2 Segmentation head
 
 - 3 output channels, **sigmoid**, nested regions per §4.2.
-- **Deep supervision** with loss weights `1/2^i` for sub-level `i` (5 levels), targets
+- **Deep supervision** with loss weights `1/2^i` for sub-level `i` (3 outputs with the shipped `blocks_down=(1,2,2,4)`), targets
   downsampled nearest-neighbor. Used by every top team.
 
 ### 10.3 Classification head — mask-conditioned pooling, not plain GAP
@@ -658,7 +664,7 @@ Three options, in increasing robustness:
 
 | Option | Mechanism | Confound risk |
 |---|---|---|
-| A. Plain GAP | global average pool over bottleneck → linear | **High.** At 128³ the bottleneck is ~8³; a flat GAP is dominated by whole-brain/background statistics, which is exactly the channel through which cohort identity leaks |
+| A. Plain GAP | global average pool over bottleneck → linear | **High.** At a 128³ patch the bottleneck is 16³ (three downsamplings); a flat GAP is dominated by whole-brain/background statistics, which is exactly the channel through which cohort identity leaks |
 | B. Mask-conditioned pooling | pool encoder features **only where the predicted tumor mask is positive** | **Low.** Restricting the classifier's receptive field to tumor voxels removes the dominant leakage path (brain contour, FOV, skull-strip geometry) |
 | C. TAFE-style attention pooling | multi-scale tumor-focused attention pooling (MTS-UNET, arXiv 2503.06828) | Low, and better accuracy; more complex |
 
@@ -761,7 +767,10 @@ L_total = L_seg + λ · L_cls
 
 **`L_seg`** — Dice + Focal, or Dice + CE. Both podiumed with no clear winner (NVAUTO and
 BiomedMBZ used Dice+Focal; CNMC/nnU-Net used Dice+CE). Start with
-`DiceCELoss(sigmoid=True, to_onehot_y=False)` on 3 nested channels, then try `DiceFocalLoss`.
+Dice + **per-channel binary cross-entropy** on the 3 nested sigmoid channels (`SegLoss("dice_ce")`), then
+try `DiceFocalLoss`. Do **not** use MONAI's `DiceCELoss` here: with more than one output channel its CE
+term is a softmax *across* the channels, so a background voxel contributes zero loss and the nested
+regions compete for one unit of probability (verified numerically; see `brats/losses.py`).
 Use **batch Dice** rather than per-sample Dice — the winners did, and it stabilizes cases with
 empty ET. Summed over deep-supervision levels with `1/2^i` weights.
 
