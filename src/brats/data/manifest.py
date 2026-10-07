@@ -119,6 +119,11 @@ def _parse_case_id(case_id: str) -> tuple[str, str]:
     return case_id, ""
 
 
+def patient_id_of(case_id: str) -> str:
+    """``BraTS-GLI-00324-001`` -> ``BraTS-GLI-00324``. Unrecognised ids are their own patient."""
+    return _parse_case_id(case_id)[0]
+
+
 def _discover_cases(cfg: DataConfig, cohort: str, split_source: str) -> list[Path]:
     root = cfg.cohort_extract_dir(cohort, split_source)
     if not root.is_dir():

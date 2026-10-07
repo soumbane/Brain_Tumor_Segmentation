@@ -43,6 +43,7 @@ import pandas as pd
 
 from brats.config import DataConfig
 from brats.constants import COHORTS, SEQUENCES
+from brats.data.manifest import patient_id_of
 
 log = logging.getLogger("brats.confound.probes")
 
@@ -179,13 +180,13 @@ def run_probe(
 ) -> dict:
     """Cross-validated cohort classification from a feature subset.
 
-    Uses grouped stratified CV and reports balanced accuracy against the majority
-    baseline. Balanced accuracy, not raw accuracy: with a 12.6:10.1:1 imbalance, raw
+    Uses stratified CV **grouped by patient** and reports balanced accuracy against the
+    majority baseline. Balanced accuracy, not raw accuracy: with a 12.6:10.1:1 imbalance, raw
     accuracy is dominated by the two large cohorts.
     """
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import balanced_accuracy_score, confusion_matrix
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
@@ -205,9 +206,13 @@ def run_probe(
         ),
     )
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+    # Grouped by patient: several timepoints of one patient are near-duplicates, and a
+    # plain StratifiedKFold lets one land in the test fold with its twin in training --
+    # the probe then recognises the patient, not the cohort, and reads optimistic.
+    groups = df["case_id"].map(patient_id_of).to_numpy()
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
     preds = np.empty_like(y)
-    for tr, te in cv.split(X, y):
+    for tr, te in cv.split(X, y, groups):
         clf.fit(X[tr], y[tr])
         preds[te] = clf.predict(X[te])
 

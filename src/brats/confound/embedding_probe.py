@@ -11,10 +11,12 @@ has *chosen* to encode it. A model could in principle discard an available short
 this measures whether ours did.
 
 **Permutation control** (the "Same Analysis Approach", arXiv 1703.06670). Re-run the
-entire pipeline with cohort labels randomly permuted. Any accuracy above chance is
+analysis with cohort labels randomly permuted. Any accuracy above chance is
 pipeline-induced optimism -- leakage, a selection artifact, or an evaluation bug --
 because with permuted labels there is nothing real to learn. This catches classes of
-error that no amount of careful reasoning will.
+error that no amount of careful reasoning will. :func:`permutation_control` applies it to
+the probe only (a fixed embedding, permuted labels); retraining the network on permuted
+labels is the stronger version and is not implemented here.
 
 **Confounding Index** (arXiv 1905.08871) gives a single reportable scalar instead of
 a narrative caveat, which is what belongs in a results table.
@@ -102,29 +104,56 @@ def extract_embeddings(
 # ---------------------------------------------------------------------------
 
 
+def patient_groups(case_ids: list[str]) -> np.ndarray:
+    """Patient id per case, for ``groups=`` below (``BraTS-GLI-00324-001`` -> ``BraTS-GLI-00324``)."""
+    from brats.data.manifest import patient_id_of
+
+    return np.asarray([patient_id_of(c) for c in case_ids])
+
+
 def embedding_probe(
-    X: np.ndarray, y: np.ndarray, seed: int = 42, n_splits: int = 5
+    X: np.ndarray,
+    y: np.ndarray,
+    seed: int = 42,
+    n_splits: int = 5,
+    groups: np.ndarray | None = None,
 ) -> dict:
     """Cross-validated linear probe for cohort from the embedding.
 
     Deliberately *linear*: a nonlinear probe measures the capacity of the probe as
     much as the content of the representation. Linear separability is the standard
     and the more conservative claim.
+
+    Pass ``groups`` (see :func:`patient_groups`) whenever a patient can contribute more
+    than one case: otherwise two timepoints of one patient straddle a fold and the probe
+    scores optimistically. ``extract_embeddings`` returns the case ids to derive them from.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import balanced_accuracy_score, confusion_matrix
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
+    # No ``multi_class`` argument: it was removed in scikit-learn 1.8, and the default
+    # lbfgs solver is multinomial for >2 classes on every version we support.
     clf = make_pipeline(
         StandardScaler(),
-        LogisticRegression(max_iter=2000, multi_class="multinomial", random_state=seed),
+        LogisticRegression(max_iter=2000, random_state=seed),
     )
-    cv = StratifiedKFold(n_splits=min(n_splits, int(np.bincount(y).min())), shuffle=True,
-                         random_state=seed)
+    if groups is None:
+        cv = StratifiedKFold(
+            n_splits=min(n_splits, int(np.bincount(y).min())), shuffle=True, random_state=seed
+        )
+        splits = cv.split(X, y)
+    else:
+        groups = np.asarray(groups)
+        per_class = min(len(np.unique(groups[y == c])) for c in np.unique(y))
+        cv = StratifiedGroupKFold(
+            n_splits=min(n_splits, per_class), shuffle=True, random_state=seed
+        )
+        splits = cv.split(X, y, groups)
     preds = np.empty_like(y)
-    for tr, te in cv.split(X, y):
+    for tr, te in splits:
         clf.fit(X[tr], y[tr])
         preds[te] = clf.predict(X[te])
 
@@ -140,21 +169,41 @@ def embedding_probe(
     }
 
 
-def permutation_control(
-    X: np.ndarray, y: np.ndarray, n_permutations: int = 100, seed: int = 42
-) -> dict:
-    """Null distribution of the embedding probe under permuted labels.
+def _permute_labels(y: np.ndarray, groups: np.ndarray | None, rng: np.random.Generator) -> np.ndarray:
+    """Shuffle labels; with ``groups``, shuffle them *between patients* so a patient keeps one label."""
+    if groups is None:
+        return rng.permutation(y)
+    uniq, first = np.unique(groups, return_index=True)
+    shuffled = dict(zip(uniq, rng.permutation(y[first]), strict=True))
+    return np.asarray([shuffled[g] for g in groups])
 
-    Any systematic gap above chance in the null means the *evaluation itself* is
+
+def permutation_control(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_permutations: int = 100,
+    seed: int = 42,
+    groups: np.ndarray | None = None,
+) -> dict:
+    """Null distribution of the embedding **probe** under permuted labels.
+
+    Any systematic gap above chance in the null means the probe's *evaluation* is
     optimistic. Returns an empirical p-value for the observed accuracy.
+
+    Scope. This permutes labels for the probe on a fixed embedding. It does **not**
+    retrain the network on permuted labels, which is what the module docstring's "re-run
+    the entire pipeline" would require and would also catch leakage upstream of the
+    embedding (splits, preprocessing). That full-pipeline control is not implemented.
     """
     rng = np.random.default_rng(seed)
-    observed = embedding_probe(X, y, seed=seed)["balanced_accuracy"]
+    observed = embedding_probe(X, y, seed=seed, groups=groups)["balanced_accuracy"]
 
     null: list[float] = []
     for i in range(n_permutations):
-        y_perm = rng.permutation(y)
-        null.append(embedding_probe(X, y_perm, seed=seed + i + 1)["balanced_accuracy"])
+        y_perm = _permute_labels(y, groups, rng)
+        null.append(
+            embedding_probe(X, y_perm, seed=seed + i + 1, groups=groups)["balanced_accuracy"]
+        )
     null_arr = np.asarray(null)
 
     # +1 smoothing: with finite permutations a p-value of exactly 0 is not supported.
@@ -247,6 +296,7 @@ def report(
 
 
 __all__ = [
+    "patient_groups",
     "extract_embeddings",
     "embedding_probe",
     "permutation_control",
