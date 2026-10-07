@@ -33,11 +33,16 @@ Two traps, both from Ferreira et al. (arXiv 2402.17317):
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
+from brats.config import REPO_ROOT
 from brats.constants import REGION_INDEX, REGIONS
+
+DEFAULT_POSTPROC_YAML = REPO_ROOT / "configs" / "postproc.yaml"
 
 # ---------------------------------------------------------------------------
 # Published reference values
@@ -110,6 +115,45 @@ class PostProcessConfig:
     enforce_nesting: bool = True
     #: 26-connectivity for 3D components, matching the official metric's convention.
     connectivity: int = 26
+
+    @classmethod
+    def from_yaml(cls, path: str | Path = DEFAULT_POSTPROC_YAML) -> "PostProcessConfig":
+        """Load the ``postprocess:`` block of ``configs/postproc.yaml``.
+
+        Strict on purpose: this file used to be read by nothing, so edits to it silently
+        did nothing. Unknown keys, unknown regions and non-numeric thresholds raise.
+        Omitted keys keep their published defaults.
+        """
+        from brats.config import load_yaml
+
+        raw = dict(load_yaml(path).get("postprocess") or {})
+        base = cls()
+        unknown = set(raw) - {f.name for f in dataclasses.fields(cls)}
+        if unknown:
+            raise ValueError(f"{path}: unknown postprocess keys {sorted(unknown)}")
+
+        def _per_region(name: str, cast) -> dict:
+            merged = dict(getattr(base, name))
+            given = raw.pop(name, None) or {}
+            bad = set(given) - set(REGIONS)
+            if bad:
+                raise ValueError(f"{path}: {name} has unknown regions {sorted(bad)}")
+            merged.update({r: cast(v) for r, v in given.items()})
+            return merged
+
+        kwargs: dict = {
+            "thresholds": _per_region("thresholds", float),
+            "min_size": _per_region("min_size", int),
+            "joint_filter": _per_region(
+                "joint_filter",
+                lambda v: JointFilterParams(
+                    s_upper=int(v["s_upper"]), s_lower=int(v["s_lower"]),
+                    p_upper=float(v["p_upper"]), p_mid=float(v["p_mid"]),
+                ),
+            ),
+        }
+        kwargs.update(raw)  # remaining scalars: use_joint_filter, apply_ped_et_gate, ...
+        return cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------

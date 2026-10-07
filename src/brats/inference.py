@@ -23,6 +23,7 @@ from __future__ import annotations
 import itertools
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -52,6 +53,45 @@ class InferenceConfig:
     device_for_output: str = "cpu"
 
     extra: dict = field(default_factory=dict)
+
+
+def inference_config_from_yaml(
+    path: str | Path | None = None,
+    roi_size: tuple[int, int, int] | None = None,
+    tta: str | None = None,
+) -> InferenceConfig:
+    """Build an :class:`InferenceConfig` from the ``inference:`` block of ``postproc.yaml``.
+
+    Args:
+        roi_size: The window the model was *trained* on. It takes precedence over the
+            YAML value, which is only a default: a different window than training is a
+            mistake, so a disagreement is logged.
+        tta: ``"none"`` or ``"eight_flip"``; overrides the YAML value (the CLI flag).
+    """
+    from brats.config import load_yaml
+    from brats.postprocess import DEFAULT_POSTPROC_YAML
+
+    raw = dict(load_yaml(path or DEFAULT_POSTPROC_YAML).get("inference") or {})
+    unknown = set(raw) - {"roi_size", "overlap", "mode", "sw_batch_size", "tta"}
+    if unknown:
+        raise ValueError(f"unknown inference keys {sorted(unknown)}")
+
+    yaml_roi = tuple(int(v) for v in raw.get("roi_size", (128, 128, 128)))
+    if roi_size is not None and tuple(roi_size) != yaml_roi:
+        log.warning(
+            "inference.roi_size %s in the YAML differs from the training patch %s; "
+            "using the training patch", yaml_roi, tuple(roi_size),
+        )
+    mode = tta if tta is not None else raw.get("tta", "none")
+    if mode not in ("none", "eight_flip"):
+        raise ValueError(f"tta must be 'none' or 'eight_flip', got {mode!r}")
+    return InferenceConfig(
+        roi_size=tuple(roi_size) if roi_size is not None else yaml_roi,  # type: ignore[arg-type]
+        sw_batch_size=int(raw.get("sw_batch_size", 4)),
+        overlap=float(raw.get("overlap", 0.5)),
+        mode=str(raw.get("mode", "gaussian")),
+        tta_flip_axes=eight_flip_axes() if mode == "eight_flip" else (),
+    )
 
 
 def eight_flip_axes() -> tuple[tuple[int, ...], ...]:
@@ -227,6 +267,7 @@ def predict_dataset(
 
 __all__ = [
     "InferenceConfig",
+    "inference_config_from_yaml",
     "predict_volume",
     "predict_dataset",
     "eight_flip_axes",

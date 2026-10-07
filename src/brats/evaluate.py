@@ -36,6 +36,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 from dataclasses import replace
@@ -49,7 +50,7 @@ from brats.config import DataConfig
 from brats.constants import COHORTS, REGIONS
 from brats.metrics.lesionwise import aggregate, lesionwise_case
 from brats.metrics.ranking import ablation_table
-from brats.postprocess import PostProcessConfig, postprocess
+from brats.postprocess import DEFAULT_POSTPROC_YAML, PostProcessConfig, postprocess
 
 log = logging.getLogger("brats.evaluate")
 
@@ -272,7 +273,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-config", default=None)
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--split", default="val", choices=["val", "test", "official_val"])
-    ap.add_argument("--tta", default="none", choices=["none", "eight_flip"])
+    ap.add_argument(
+        "--postproc-config", default=None,
+        help="post-processing / inference YAML (default: configs/postproc.yaml)",
+    )
+    ap.add_argument(
+        "--tta", default=None, choices=["none", "eight_flip"],
+        help="override inference.tta from the post-processing YAML",
+    )
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out-dir", default=None)
     ap.add_argument(
@@ -298,9 +306,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     from brats.data.transforms import CachedBratsDataset, load_records, val_transforms
-    from brats.inference import InferenceConfig, eight_flip_axes, predict_dataset
-    from brats.models.multitask import MultiTaskConfig, build_model
-    from brats.train import CheckpointManager, TrainConfig
+    from brats.inference import inference_config_from_yaml, predict_dataset
+    from brats.models.multitask import MultiTaskConfig, load_model_from_checkpoint
+    from brats.train import TrainConfig
 
     cfg = TrainConfig.from_yaml(args.config)
     data_cfg = DataConfig.load(args.data_config) if args.data_config else DataConfig.load()
@@ -310,10 +318,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(
-        MultiTaskConfig(pooling=cfg.pooling, warmup_epochs=cfg.cls_warmup_epochs)  # type: ignore[arg-type]
+    # The architecture comes from the checkpoint itself (norm type is chosen at train
+    # time); the YAML is only the fallback for checkpoints that predate that field.
+    model = load_model_from_checkpoint(
+        args.checkpoint,
+        fallback=MultiTaskConfig(
+            pooling=cfg.pooling, warmup_epochs=cfg.cls_warmup_epochs  # type: ignore[arg-type]
+        ),
     ).to(device)
-    CheckpointManager(cfg).load(model, path=Path(args.checkpoint))
 
     labeled = args.split != "official_val"
     ds = CachedBratsDataset(
@@ -322,17 +334,24 @@ def main(argv: list[str] | None = None) -> int:
         load_label=labeled,
     )
 
-    inf_cfg = InferenceConfig(
-        roi_size=cfg.patch_size,
-        tta_flip_axes=eight_flip_axes() if args.tta == "eight_flip" else (),
+    pp_cfg = PostProcessConfig.from_yaml(args.postproc_config or DEFAULT_POSTPROC_YAML)
+    inf_cfg = inference_config_from_yaml(
+        args.postproc_config, roi_size=cfg.patch_size, tta=args.tta
     )
-    log.info("predicting %d cases (tta=%s)", len(ds), args.tta)
+    log.info(
+        "predicting %d cases (tta=%s, %d flips)", len(ds),
+        "eight_flip" if inf_cfg.tta_flip_axes else "none", len(inf_cfg.tta_flip_axes) or 1,
+    )
     predictions = list(
         predict_dataset(model, ds, cfg=inf_cfg, device=device, limit=args.limit)
     )
 
     seg_scores = (
-        evaluate_segmentation(predictions) if labeled else pd.DataFrame()
+        evaluate_segmentation(predictions, base_cfg=pp_cfg) if labeled else pd.DataFrame()
+    )
+    # Provenance: the numbers below are only interpretable next to the settings behind them.
+    (out_dir / "postprocess_config.json").write_text(
+        json.dumps(dataclasses.asdict(pp_cfg), indent=2), encoding="utf-8"
     )
     cls_df, cls_metrics = evaluate_classification(predictions)
 

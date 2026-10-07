@@ -230,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--split", default="official_val",
                     choices=["val", "test", "official_val"])
+    ap.add_argument("--postproc-config", default=None,
+                    help="post-processing / inference YAML (default: configs/postproc.yaml)")
     ap.add_argument("--max-per-cohort", type=int, default=8)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--out-dir", default=None)
@@ -241,9 +243,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from brats.config import DataConfig
     from brats.data.transforms import CachedBratsDataset, load_records, val_transforms
-    from brats.inference import InferenceConfig, predict_dataset
-    from brats.models.multitask import MultiTaskConfig, build_model
-    from brats.train import CheckpointManager, TrainConfig
+    from brats.inference import inference_config_from_yaml, predict_dataset
+    from brats.postprocess import DEFAULT_POSTPROC_YAML, PostProcessConfig
+    from brats.models.multitask import MultiTaskConfig, load_model_from_checkpoint
+    from brats.train import TrainConfig
 
     cfg = TrainConfig.from_yaml(args.config)
     data_cfg = DataConfig.load(args.data_config) if args.data_config else DataConfig.load()
@@ -252,8 +255,10 @@ def main(argv: list[str] | None = None) -> int:
         data_cfg.reports_dir / f"qc_{args.split}"
     )
 
-    model = build_model(MultiTaskConfig(pooling=cfg.pooling)).to(device)  # type: ignore[arg-type]
-    CheckpointManager(cfg).load(model, path=Path(args.checkpoint))
+    model = load_model_from_checkpoint(
+        args.checkpoint,
+        fallback=MultiTaskConfig(pooling=cfg.pooling),  # type: ignore[arg-type]
+    ).to(device)
 
     labeled = args.split != "official_val"
     ds = CachedBratsDataset(
@@ -263,7 +268,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     preds = []
-    inf_cfg = InferenceConfig(roi_size=cfg.patch_size, tta_flip_axes=())
+    pp_cfg = PostProcessConfig.from_yaml(args.postproc_config or DEFAULT_POSTPROC_YAML)
+    # Montages are for eyeballing, so TTA stays off regardless of the YAML.
+    inf_cfg = inference_config_from_yaml(args.postproc_config, roi_size=cfg.patch_size, tta="none")
     for i, pred in enumerate(
         predict_dataset(model, ds, cfg=inf_cfg, device=device, limit=args.limit)
     ):
@@ -271,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         pred["image"] = np.asarray(ds[i]["image"])
         preds.append(pred)
 
-    montage_from_predictions(preds, out_dir, max_per_cohort=args.max_per_cohort)
+    montage_from_predictions(preds, out_dir, cfg=pp_cfg, max_per_cohort=args.max_per_cohort)
     return 0
 
 
