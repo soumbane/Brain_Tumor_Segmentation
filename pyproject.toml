@@ -33,6 +33,9 @@ snowflake = [
     "snowflake-connector-python",
     "snowflake-snowpark-python",
 ]
+dev = [
+    "pytest>=8.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -40,6 +43,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/brats"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Lets `pytest` run from a plain checkout without `pip install -e .`.
+pythonpath = ["src"]
 
 [tool.uv]
 # Corporate TLS inspection breaks uv's bundled cert bundle; use the OS store.
