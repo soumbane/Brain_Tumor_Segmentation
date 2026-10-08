@@ -1,7 +1,7 @@
 # Baseline recipe: SegResNetDS multi-task, Databricks Serverless GPU (1x H100 80GB).
 #
 # Synthesized from the BraTS 2023 winners. Single-GPU, no DDP.
-# Batch 4 on 80 GB VRAM; effective batch 4.
+# Batch 16 on 80 GB VRAM; effective batch 16.
 #
 # WARNING on learning rate: every published BraTS recipe used batch 1-5 under
 # 16-48 GB VRAM limits. LR is an early sweep target, not a settled value.
@@ -11,8 +11,8 @@ train:
 
   # -- geometry / throughput ------------------------------------------------
   patch_size: [128, 128, 128]   # CNMC (PED), BiomedMBZ
-  batch_size_per_gpu: 4         # single H100 80GB; effective batch 4
-  num_workers: 0                # debug: rule out FUSE/multiprocessing NaN issue
+  batch_size_per_gpu: 16        # single H100 80GB; effective batch 16
+  num_workers: 4                # parallel data loading from Volume FUSE mount
   amp_dtype: bfloat16           # A10G is Ampere; bf16 needs no GradScaler
 
   # -- schedule -------------------------------------------------------------
