@@ -16,8 +16,8 @@ train:
   amp_dtype: bfloat16           # A10G is Ampere; bf16 needs no GradScaler
 
   # -- schedule -------------------------------------------------------------
-  epochs: 50                    # initial trial run on Databricks
-  warmup_epochs: 4              # proportional to 50 epochs; cosine anneal to zero
+  epochs: 100                   # full training run on Databricks
+  warmup_epochs: 8              # ~8% of total epochs; cosine anneal to zero
   lr: 2.0e-4                    # AdamW, NVAUTO/SegResNet lineage. SWEEP THIS.
   weight_decay: 1.0e-5
   optimizer: adamw              # alt: sgd (nnU-Net lineage, lr 0.01 mom 0.99)
@@ -32,7 +32,7 @@ train:
 
   # -- classification head --------------------------------------------------
   pooling: tumor_attention      # alt: gap (confound ablation), tafe (upgrade)
-  cls_warmup_epochs: 10         # proportional to 50 epochs; GT-mask teacher forcing
+  cls_warmup_epochs: 20         # ~20% of total epochs; GT-mask teacher forcing
   cohort_balanced_sampling: true
 
   # -- experiment tracking (MLflow / Databricks) ----------------------------
@@ -40,7 +40,7 @@ train:
   mlflow_experiment: ''       # empty = notebook default experiment
 
   # -- validation / checkpointing -------------------------------------------
-  val_every: 5
+  val_every: 10                 # validate every 10 epochs (100 epochs total)
   val_max_cases: 60             # stratified subset, for speed
   seed: 42
   ckpt_dir: checkpoints
