@@ -190,7 +190,19 @@ class WandbLogger:
 
 
 class MLflowLogger:
-    """MLflow tracker for Databricks. Same interface as WandbLogger."""
+    """MLflow tracker for Databricks. Same interface as WandbLogger.
+
+    When the env var ``MLFLOW_RUN_ID`` is set the logger attaches to that
+    existing run instead of creating a new one. This lets the notebook cell
+    own the run lifecycle (create before training, end after evaluation) while
+    the training subprocess logs metrics into the same run. The logger will
+    *not* call ``end_run()`` for externally-managed runs.
+
+    System-metrics monitoring is disabled by default
+    (``MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false``) because its trace data
+    causes the Databricks experiment page to render the GenAI observability
+    view instead of the classic Runs / Charts view.
+    """
 
     def __init__(
         self,
@@ -203,6 +215,7 @@ class MLflowLogger:
         self.enabled = bool(enabled) and is_rank_zero
         self._run = None
         self._warned = False
+        self._externally_managed = False
 
         if not self.enabled:
             return
@@ -215,14 +228,11 @@ class MLflowLogger:
             self.enabled = False
             return
 
-        try:
-            # Resolve experiment: explicit arg > env var > default path.
-            exp = experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME")
-            if exp:
-                mlflow.set_experiment(exp)
+        # Disable system-metrics monitor to keep the classic MLflow UI.
+        os.environ.setdefault("MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING", "false")
 
+        try:
             cfg_dict = asdict(config) if is_dataclass(config) else (config or {})
-            # MLflow params must be strings; flatten complex types.
             params = {}
             for k, v in cfg_dict.items():
                 if isinstance(v, (dict, list, tuple)):
@@ -230,9 +240,21 @@ class MLflowLogger:
                 else:
                     params[k] = v
 
-            self._run = mlflow.start_run(run_name=run_name)
-            mlflow.log_params(params)
-            log.info("mlflow run %r started (run_id=%s)", run_name, self._run.info.run_id)
+            # If a run was already started by the notebook cell, attach to it.
+            run_id = os.environ.get("MLFLOW_RUN_ID")
+            if run_id:
+                self._run = mlflow.start_run(run_id=run_id)
+                self._externally_managed = True
+                mlflow.log_params(params)
+                log.info("mlflow attached to existing run (run_id=%s)", run_id)
+            else:
+                exp = experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME")
+                if exp:
+                    mlflow.set_experiment(exp)
+                self._run = mlflow.start_run(run_name=run_name)
+                mlflow.log_params(params)
+                log.info("mlflow run %r started (run_id=%s)",
+                         run_name, self._run.info.run_id)
         except Exception as exc:  # noqa: BLE001
             log.warning("mlflow init failed (%s); continuing without tracking", exc)
             self.enabled = False
@@ -268,6 +290,17 @@ class MLflowLogger:
         # MLflow does not have gradient watching; no-op.
         pass
 
+    def log_figure(self, fig: Any, artifact_file: str) -> None:
+        """Log a matplotlib figure directly as an image artifact."""
+        if not self.enabled or self._run is None:
+            return
+        try:
+            self._mlflow.log_figure(fig, artifact_file)
+        except Exception as exc:  # noqa: BLE001
+            if not self._warned:
+                log.warning("mlflow figure logging failed (%s)", exc)
+                self._warned = True
+
     def log_artifact(self, path: str | Path, name: str, type_: str = "model") -> None:
         if not self.enabled or self._run is None:
             return
@@ -286,6 +319,10 @@ class MLflowLogger:
 
     def finish(self) -> None:
         if not self.enabled or self._run is None:
+            return
+        if self._externally_managed:
+            # Run lifecycle is owned by the notebook cell; don't end it here.
+            self._run = None
             return
         try:
             self._mlflow.end_run()
