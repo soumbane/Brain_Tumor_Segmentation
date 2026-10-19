@@ -1,103 +1,89 @@
-# =============================================================================
-# SPCS job spec for BraTS 2023 single-GPU training.
-#
-# Database : CARE_ML_RESEARCH_WKSP
-# Schema   : BRAIN_TUMOR_SEG
-# Pool     : SYSTEM_COMPUTE_POOL_GPU (GPU_NV_S, 1x A10G 24 GB)
-# Role     : SFK_CARE_ML_RSRCH_ADM
-#
-# Upload this spec then run:
-#
-#   USE ROLE SFK_CARE_ML_RSRCH_ADM;
-#   USE DATABASE CARE_ML_RESEARCH_WKSP;
-#   USE SCHEMA BRAIN_TUMOR_SEG;
-#
-#   EXECUTE JOB SERVICE
-#     IN COMPUTE POOL SYSTEM_COMPUTE_POOL_GPU
-#     NAME = BRATS_TRAIN_V1
-#     FROM @SPECS_STAGE
-#     SPEC = 'service_spec.yaml';
-#
-# Monitor:
-#   SELECT SYSTEM$GET_SERVICE_LOGS('BRATS_TRAIN_V1', 0, 'train');
-#
-# Clean up:
-#   DROP SERVICE IF EXISTS BRATS_TRAIN_V1;
-# =============================================================================
-
+# TEMPLATE ONLY. Render concrete identities/deadline/image/SECRET after approval.
+# Target pool CARE_ML_RSRCH_GPU_M; one node, four independent A10G devices.
+# Fresh launch deliberately omits --resume. Resource fit requires GPU smoke.
 spec:
   containers:
     - name: train
-      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:latest
-
+      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:REQUIRED_IMMUTABLE_TAG
       command:
         - python
+        - /app/spcs/supervise.py
+        - --grace
+        - "120"
+        - --
+        - python
+        - -m
+        - torch.distributed.run
+        - --standalone
+        - --nnodes=1
+        - --nproc_per_node=4
         - -m
         - brats.train
         - --config
-        - /app/configs/segresnet_base.yaml
-        - --no-wandb
-        - --resume
-        - --epochs
-        - "50"
-
+        - /app/configs/segresnet_spcs.yaml
       env:
-        OMP_NUM_THREADS: "6"
+        OMP_NUM_THREADS: "1"
+        MKL_NUM_THREADS: "1"
+        OPENBLAS_NUM_THREADS: "1"
+        NUMEXPR_NUM_THREADS: "1"
         NCCL_DEBUG: "WARN"
-        WANDB_MODE: "disabled"
-        # Override data.yaml Windows paths to point at the stage mounts.
-        # DATASET_STAGE is mounted at /mnt/data. Files are uploaded as:
-        #   @DATASET_STAGE/GLI/*.npz, @DATASET_STAGE/MEN/*.npz, @DATASET_STAGE/PED/*.npz
-        #   @DATASET_STAGE/splits/split_random_seed42.csv
-        #   @DATASET_STAGE/manifest/*.csv
+        WANDB_MODE: "online"
+        WANDB_CONSOLE: "off"
+        WANDB_DISABLE_CODE: "true"
+        WANDB_DISABLE_GIT: "true"
+        WANDB_SAVE_CODE: "false"
         BRATS_CACHE_ROOT: "/mnt/data"
         BRATS_SPLITS_CSV: "/mnt/data/splits/split_random_seed42.csv"
         BRATS_MANIFEST_DIR: "/mnt/data/manifest"
-        # Write checkpoints to the mounted OUTPUT_STAGE so they survive restarts.
-        BRATS_CKPT_ROOT: "/mnt/ckpt"
-
+        BRATS_CKPT_ROOT: "/work"
+        BRATS_ARTIFACT_ROOT: "/mnt/output/training"
+        BRATS_RUN_ID: "REQUIRED_UNIQUE_RUN_ID"
+        BRATS_ATTEMPT_ID: "REQUIRED_UNIQUE_ATTEMPT_ID"
+        BRATS_CACHE_AUDIT_PATH: "REQUIRED_VERIFIED_AUDIT_PATH"
+        BRATS_EXPECTED_SPLIT_SHA256: "REQUIRED_FROZEN_SPLIT_SHA256"
+        BRATS_WANDB_ENTITY: "REQUIRED_AUTHORIZED_ENTITY"
+        BRATS_MAX_RUNTIME_SECONDS: "REQUIRED_APPROVED_SECONDS"
+      secrets:
+        - snowflakeSecret:
+            objectName: CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.REQUIRED_WANDB_SECRET
+          secretKeyRef: secret_string
+          envVarName: WANDB_API_KEY
       resources:
         requests:
-          nvidia.com/gpu: 1
-          memory: 20Gi
-          cpu: 6
+          nvidia.com/gpu: 4
+          cpu: 40
+          memory: 144Gi
         limits:
-          nvidia.com/gpu: 1
-          memory: 24Gi
-
+          nvidia.com/gpu: 4
+          cpu: 40
+          memory: 160Gi
       volumeMounts:
-        - name: data-vol
+        - name: data
           mountPath: /mnt/data
-        - name: output-vol
-          mountPath: /mnt/ckpt
-
+        - name: output
+          mountPath: /mnt/output
+        - name: work
+          mountPath: /work
+        - name: shm
+          mountPath: /dev/shm
   volumes:
-    # Preprocessed .npz cache + splits + manifest, uploaded via SnowSQL PUT.
-    - name: data-vol
-      source: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.DATASET_STAGE"
-
-    # Checkpoints written every epoch. On resume, the latest checkpoint is
-    # loaded automatically. Survives SPCS maintenance restarts.
-    - name: output-vol
-      source: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE"
-
-
-# =============================================================================
-# Multi-GPU variant (GPU_NV_M: 4x A10G) -- requires a dedicated compute pool.
-#
-# 1. Change command to:
-#      command: ["torchrun", "--nproc_per_node=4"]
-#      args: ["-m", "brats.train", "--config", "/app/configs/segresnet_base.yaml",
-#             "--no-wandb", "--resume"]
-#
-# 2. Change resources to:
-#      requests:
-#        nvidia.com/gpu: 4
-#        memory: 160Gi
-#        cpu: 40
-#      limits:
-#        nvidia.com/gpu: 4
-#        memory: 178Gi
-#
-# 3. Run on a GPU_NV_M pool (not SYSTEM_COMPUTE_POOL_GPU which is GPU_NV_S).
-# =============================================================================
+    # Application read-only contract, NOT an invented readOnly field or RBAC claim.
+    - name: data
+      source: stage
+      stageConfig:
+        name: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.DATASET_STAGE"
+    - name: output
+      source: stage
+      stageConfig:
+        name: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE"
+    - name: work
+      source: local
+    - name: shm
+      source: memory
+      size: 16Gi
+  logExporters:
+    eventTableConfig:
+      logLevel: INFO
+  platformMonitor:
+    metricConfig:
+      groups: [system, system_limits, network, storage]

@@ -43,6 +43,21 @@ external/
 Thumbs.db
 desktop.ini
 
+# Local credentials never enter build context (including untracked files).
+.env
+.env.*
+*.pem
+*.key
+.netrc
+secrets/
+credentials*.json
+wandb/
+
+# Keep generated test/cache content out; verification mounts tests explicitly.
+.pytest_cache/
+/htmlcov/
+/tests/
+
 # Documentation (not needed at runtime)
 README.md
 RUNBOOK.md

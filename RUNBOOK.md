@@ -35,11 +35,11 @@ wandb login
 git clone https://github.com/rachitsaluja/BraTS-2023-Metrics.git external/brats_metrics
 ```
 
-**Snowflake prerequisites — blocking for anything GPU.** Your user holds only
-`PUBLIC` and `SFK_CORP_JIRA`; `CREATE COMPUTE POOL` is an account-level privilege you
-do not have, and no external access integration exists. Hand
-`scripts/admin_grants.sql` to someone with `ACCOUNTADMIN`. Phases 1–4 below run
-without it.
+**Snowflake launch gates:** project stages/repository and suspended
+`CARE_ML_RSRCH_GPU_M` were observed under `SFK_CARE_ML_RSRCH_ADM`. EAI inspection
+is blocked by Restricted Session Scope; use `/guardrails`, not an admin-role
+workaround. Secret/entity, telemetry, credits and paid-run approval remain
+unresolved. See sections 4-6 for the current SPCS workflow.
 
 ---
 
@@ -136,85 +136,168 @@ Things that behave differently from what you might assume:
 * If a cache was written before the z-axis crop fix, re-run `python -m brats.data.preprocess --overwrite --verify`
   (brains spanning more than 144 slices were silently clipped).
 
-## 4. Stage to Snowflake *(needs the admin grants)*
+## 4. SPCS local image and launch prerequisites
 
-```powershell
-.venv\Scripts\python.exe -m brats.snowflake.stage_data --print-sql   # stage DDL
-.venv\Scripts\python.exe -m brats.snowflake.stage_data --estimate    # size check
-.venv\Scripts\python.exe -m brats.snowflake.stage_data --stage @BRATS_MRI.CORE.DATA
+The approved workflow is a finite Docker/torchrun job, not the legacy
+`brats.snowflake.submit_job` ML Jobs examples. Keep Databricks notebooks and
+`segresnet_base.yaml` unchanged; use `configs/segresnet_spcs.yaml` for SPCS.
+The SPCS candidate is four A10Gs on `CARE_ML_RSRCH_GPU_M`, batch 2 per GPU,
+global batch 8 (not Databricks' 16), 128-cubed, bf16, 100 epochs, LR warmup 8,
+attention warmup 20. DDP retains class-weighted CE and rank-local batch Dice;
+it does not use the single-process cohort-balanced sampler. Do not silently
+change the learning rate or sampling algorithm.
+
+Local preparation (no registry push, stage upload, W&B run or GPU job):
+
+```bash
+bash spcs/build.sh spcs-YYYYMMDD-unique-source-build
+# The script refuses existing tags and latest, checks pip, imports and CPU model.
+# tests are mounted, not baked into the runtime image:
+docker run --rm --network none --hostname brats-local \
+  --add-host brats-local:127.0.0.1 --platform linux/amd64 --shm-size 2g \
+  -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/repo/src \
+  -v "$PWD:/repo:ro" -w /repo brats-train:spcs-YYYYMMDD-unique-source-build \
+  python -m pytest /repo/tests -q -rs -p no:cacheprovider
 ```
 
----
+The Dockerfile pins a runtime base by digest and constrains Torch so dependency
+resolution cannot replace its CUDA wheel. The initial 2.8.0/1.6.0 candidate was
+not accepted blindly: PyPI advisory metadata reports Torch checkpoint/unpickler
+and other local API issues and MONAI bundle-eval issues. The replacement candidate
+is Torch 2.13.0/CUDA 12.6 and MONAI 1.6.1. Metadata showing no listed advisories is
+not a complete vulnerability scan. Evidence checked October 15, 2026:
+[PyTorch 2.8 metadata](https://pypi.org/pypi/torch/2.8.0/json), including
+[PYSEC-2026-2286](https://osv.dev/vulnerability/PYSEC-2026-2286), and
+[MONAI 1.6.0 metadata](https://pypi.org/pypi/monai/1.6.0/json), including
+[PYSEC-2026-4017](https://osv.dev/vulnerability/PYSEC-2026-4017).
+The selected direct pins had no listed PyPI advisories; OS/transitive scanning
+and account GPU driver checks remain separate gates. Pytest 9.0.3 avoids the
+listed temporary-directory issue in <=9.0.2. `/app/build-provenance.json` contains actual
+source/config hashes and versions; `/app/dependencies.lock.txt` captures resolved
+transitives. OCI labels include source revision and dirty-working-tree digest.
+Final rebuild must happen after all source edits, under another immutable tag.
+Python 3.11/3.12, imports, model forward/backward, image platform and pinned SDK
+settings must pass; CPU success does not establish GPU driver/NCCL compatibility.
 
-## 5. GPU smoke test — the compute gate
+Before any remote action, resolve these gates:
 
-```powershell
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --smoke-test
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --status <job_id>
-```
+- `/guardrails`: current Restricted Session Scope blocks the EAI inspection.
+  Do not bypass by role changes, removing restrictions, or alternate CLI SQL.
+- Explicit W&B entity, project `brats2023`, and securely provisioned project
+  SECRET injected into `WANDB_API_KEY` through `containers.secrets`. Values go
+  through `/secrets`, never chat/spec/build args or source. Local secret storage
+  is not Snowflake SECRET provisioning. First verify project-role CREATE SECRET
+  and READ/ownership; do not assume ACCOUNTADMIN is necessary.
+- Verify `CARE_ML_RSRCH_INTERNET_EAI` usage, job attachment, required W&B API and
+  signed-upload hosts, and exact create/observe/cancel privileges using
+  `SFK_CARE_ML_RSRCH_ADM`. No wildcard egress or TLS bypass.
+- Verify full CPU cache integrity and frozen split digest. Old staged NPZ files
+  may predate the z-crop fix; a rebuilt image does not repair them. Stop/report
+  mismatches; do not regenerate splits or alter labels. The all-case mechanical
+  audit may inspect test labels for integrity, never predictions or tuning.
+- Confirm intended monitoring warehouse (observed `CORP_ENTITY_XS_WH` differs
+  from supplied `CARE_ENTITY_XS_WH`), available credit history, and approved smoke
+  runtime/startup deadline. Fill every `REQUIRED_*` template value before upload.
 
-**Gate.** 4 visible A10G GPUs, `bf16 supported: True`, a successful 128³ forward pass
-with reported peak VRAM, and one cached case loading with label values ⊆ {0,1,2,3}.
+`spcs/push.sh TAG --approve-image-push` only pushes an existing reviewed image
+and requires independently verified remote tag absence. Registry login, image
+push, spec upload, secret/EAI changes and paid jobs each need concrete approval.
+Do not overwrite the previous `latest` image. No new pools or public endpoints.
 
----
+## 5. Bounded four-GPU smoke and recovery gate
 
-## 6. Train
+`spcs/service_spec.yaml` is a non-launchable template until prerequisites above
+are filled. It launches four local processes with `python -m torch.distributed.run
+--standalone --nnodes=1 --nproc_per_node=4` (torchrun's module entry point), not four
+GPUs pooled into one address space. The module entry point keeps elastic and rank
+workers on the image virtual environment rather than a system-script shebang.
+CPU40/RAM144Gi request, RAM160Gi limit and 16Gi shared-memory are candidates;
+shared memory and loader copies count toward memory. Verify sidecar headroom,
+schedulability and measured memory. DATASET_STAGE is read-only by application
+contract, not enforced by an invented YAML readOnly flag or by stage ownership.
+All mutable checkpoints/logs use `/work`; only closed immutable objects and
+completion manifests publish under OUTPUT_STAGE run prefixes.
 
-```powershell
-# Short smoke run first: confirms the loop, then confirms RESUMABILITY.
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 5 `
-  --run-name smoke
+Use a distinct smoke run and explicit approved seconds. Require four CUDA GPUs,
+bf16 and NCCL, at least two successful batch-2/rank full128-cubed updates,
+validation followed by more training, and measured peak VRAM per rank. Stop on
+OOM or configuration mismatch; do not shrink the recipe silently. Verify a
+completed epoch and its hashes, kill mid-next-epoch, resume into fresh local
+storage with the same run ID/new attempt ID, and perform another update.
+Resume must reject missing/incompatible checkpoints and preserve one exact
+collectively selected completed epoch. Partial-epoch work can be lost; CUDA
+bit-identical replay is not promised. Never publish partial weights as complete.
 
-# Kill it mid-run, then:
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 5 `
-  --run-name smoke --resume
+`spcs/supervise.py` bounds container execution, sends TERM then bounded KILL,
+and tracks elastic rank sessions, adopted orphans and loader descendants with
+Linux subreaper/process identity checks. The runtime's collective stop handling
+gets a finite grace (120s candidate). Forced termination can interrupt publication;
+readers must fall back to the previous verified completion. No pool suspend.
 
-# Baseline, then the full recipe.
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 50 `
-  --run-name baseline
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 150 `
-  --run-name segresnet_full
+The container clock does **not** cover queue, node resume or image pull. Before
+submission record a local receipt with exact fully qualified unique `job`,
+`owner`, `created_on`, timezone-aware `startup_deadline` and `hard_deadline`, and
+`cancellation_approved: true`. Independently observe that exact job's same
+identity and `state`; run `python spcs/monitor.py deadline --receipt receipt.json
+--observation observation.json` between bounded observations. If startup or hard
+deadline expires, use the separately verified own-job cancellation operation,
+then keep observing until terminal and confirm no running containers. An API
+error or missing log is not proof of termination. The helper intentionally does
+not execute unverified SQL or cancel anything while scope/permissions are
+unresolved. Operator presence is mandatory until a remote watcher is verified.
 
-# THE REQUIRED ABLATION: does the classification head cost segmentation Dice?
-# Matched backbone, split, and schedule -- only lambda differs.
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 150 `
-  --lambda-cls 0.0 --run-name seg_only_ablation
+## 6. Tracking, observability and the full-run decision
 
-# Confound ablation: plain GAP instead of tumor-attention pooling. Measures how much
-# the confound is worth. Edit `pooling: gap` in the config for this arm.
-```
+SPCS requires online numeric-only W&B preflight; missing key/entity/SDK or failed
+init stops before training. It never silently falls back offline. Generated UUID
+run identity is stored with checkpoints; resume uses that same ID and SDK-managed
+monotonic event steps, while optimizer step is a separate numeric field. Replayed
+epochs remain visible; W&B does not rewind. Names/tags are generated, configuration,
+summary and metric keys have closed allowlists, and artifact/watch methods are
+no-ops in this profile. Console, code, git, metadata and automatic system capture
+are disabled. MRI/PNG/NIfTI, identifiers, tables, source and model artifacts stay
+in local/Snowflake storage, not W&B. Do not indiscriminately sync SDK directories.
 
-**Gate (smoke).** Training resumes cleanly from a stage checkpoint after a forced
-kill. Not optional: SPCS maintenance windows (Sat/Sun) can cancel a running job
-service and Snowflake will not restart it.
+After successful preflight, tracking errors are visible but nonfatal. Local
+`tracking-health.json` and `tracking-metrics.jsonl` snapshots are authoritative.
+`flush_ok` records SDK finish, **not** independently verified remote history or
+file inventory; `remote_history_verified` stays false until separately checked.
+The approved smoke must read back numeric history and inspect actual W&B run
+files for console/source/case metadata before accepting privacy/egress. An init
+success alone does not prove signed uploads or history flush.
 
-**Gate (full).** GLI average lesion-wise Dice ≥ 0.78 on validation.
+The spec requests platform metric groups `system`, `system_limits`, `network`,
+`storage` and event-table log export. Actual collection and privileges must be
+verified on the named smoke job. Current container logs use
+`SYSTEM$GET_SERVICE_LOGS`; historical service-scoped `SPCS_GET_LOGS` and
+`SPCS_GET_METRICS` helpers avoid blanket event-table access where owner/MONITOR
+and collection permit. These names are documentation guidance, not evidence
+that this account is collecting them. Keep local/stage snapshots as fallback.
+See [monitoring services](https://docs.snowflake.com/en/developer-guide/snowpark-container-services/monitoring-services).
 
-### Experiment tracking (Weights & Biases)
+Cost reporting must separate:
 
-Enabled in `configs/segresnet_base.yaml` (`wandb: true`), **offline by default**.
-Offline needs no network at all: run data lands in `runs/wandb/` for a later sync.
+- Live estimates: `python spcs/monitor.py estimate --node-hours OBSERVED_HOURS`
+  reports unknown credits without an evidenced rate. Add
+  `--credits-per-node-hour VERIFIED_RATE` only when supplied/verified; include
+  startup/idle/tail and shared-pool assumptions. No invented dollar rate.
+- Delayed actual **pool** credits: documented
+  `SNOWFLAKE.ACCOUNT_USAGE.SNOWPARK_CONTAINER_SERVICES_HISTORY` is hourly and may
+  lag up to 180 minutes. It is not exact per-run live billing. Access remains
+  unverified; an earlier permission failure is not zero spend. Ask for a narrow
+  project-pool report/view if needed, not blanket admin. Validate any alternative
+  API before promising it. Monitoring SQL warehouse cost is separate.
 
-```powershell
-# Live curves instead. Needs WANDB_EAI + the API-key secret from admin_grants.sql.
-.venv\Scripts\python.exe -m brats.snowflake.submit_job --train --epochs 150 `
-  --wandb-mode online --wandb-secret BRATS_MRI.CORE.WANDB_API_KEY
+Resource monitors do not hard-cap SPCS compute pools. The requested 1000-credit
+monthly value is unverified; budgets/alerts are delayed, not instantaneous caps.
+After smoke, report train/validation/checkpoint times and full-run time/credit
+range, then obtain a full-run duration/spend decision. Never auto-launch full
+training or automatically suspend a shared pool.
 
-# Or retrieve an offline run afterwards and sync it locally.
-wandb sync runs\wandb\offline-run-*
-```
-
-Only rank 0 logs, so the four ranks cannot interleave into one unusable curve.
-Ablation arms are auto-tagged (`ablation-seg-only`, `ablation-gap-confound`,
-`uncertainty-weighting`) — use `--wandb-group` to compare them side by side. Every
-tracker call is failure-tolerant: a network blip or an expired key degrades to a
-no-op rather than killing a job that has been burning A10G credits for hours.
-
-Local single-GPU or CPU debugging of the same code path:
-
-```powershell
-.venv\Scripts\python.exe -m brats.train --config configs/segresnet_base.yaml --epochs 1
-```
+`spcs/inference_spec.yaml` targets one GPU on `CARE_ML_RSRCH_GPU_S` (pool remains
+unverified). It streams validation first into a fresh local directory, publishing
+original-grid NIfTI, compact results and bounded QC to OUTPUT_STAGE. No online
+API and no model registry. Internal-test evaluation remains explicitly gated.
 
 ---
 
@@ -285,18 +368,29 @@ number** — n≈10 there, and differences under 0.05 Dice are noise.
 
 ## Status
 
+Historical local data reports below have not been regenerated in this session.
+The user reports a successful Databricks notebook run; its metrics/checkpoints
+were not independently inspected. The current SPCS image is
+`brats-train:spcs-20261015-local2` (linux/amd64), with Python 3.12.3,
+PyTorch 2.13.0+cu126, MONAI 1.6.1 and W&B 0.23.0. Dependency checks and a CPU
+model forward/backward pass succeeded. No registry push, remote W&B run or
+paid GPU job was performed. Independent final-review workers could not start
+(`ENOENT: uv_cwd`); the parent performed the final review instead.
+
 | Step | State |
 |---|---|
-| 0. Environment | **done** — uv, Python 3.12.14, venv, core deps, CPU torch 2.13 + MONAI 1.6.0, wandb 0.29 |
+| 0. Environment | SPCS local image validated as above; host Python 3.14 is outside the supported project range |
 | 0. `external/brats_metrics` clone | **not done** — needed before reporting any number |
-| 0. Snowflake grants | **blocked** — needs `ACCOUNTADMIN` to run `scripts/admin_grants.sql` |
+| 0. Snowflake launch | **blocked** - scoped EAI inspection, secret/entity, telemetry/cost and explicit paid-job approval remain |
 | 1a. Extract | **done** — 2755 cases: GLI 1251/219, MEN 1000/141, PED 99/45, all counts exact |
 | 1b. Manifest | **done, PASSED** — 0 label-4s, labels exactly {0,1,2,3}, 0 integrity errors |
 | 1c. Splits | **done, committed** — `splits/split_random_seed42.csv`, 0 patient leakage |
 | 2. Confound pre-screen | **done** — mask geometry alone reaches 0.769 balanced acc (chance 0.333) |
 | 3. Preprocess cache | **NOT RUN here** — re-run with `--overwrite --verify` if built before the z-crop fix |
-| 6. Train / 7. Evaluate | code complete and unit-tested (174 tests, CPU); **not run on a GPU or on real data** |
-| Lesion-wise metric | matches the official implementation exactly (Dice, TP/FP/FN); HD95 within ~0.5 mm — `verify_against_official()` |
-| 4–9 | not run (4+ blocked on grants) |
+| 6. Train / 7. Evaluate | Final baked SPCS image: 250 CPU tests passed, 3 skipped; distributed CUDA execution remains unverified |
+| Lesion-wise metric | Internal approximate HD95; official-reference tests skipped because the reference repository is absent |
+| SPCS rollout | No remote launch; follow sections 4-6, including cache audit and bounded GPU smoke |
 
-All scripts are written and unit-tested (`pytest`). Resume at step **3**. The pre-screen numbers above were produced with a patient-leaky CV and should be re-run (`python -m brats.confound.probes --max-cases 300`).
+The historical pre-screen numbers above used patient-leaky CV and should be rerun
+before scientific interpretation. Do not regenerate the frozen split. Validate
+the existing staged cache before deciding whether preprocessing repair is needed.

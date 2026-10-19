@@ -4,13 +4,21 @@ Multi-task 3D deep learning on the ASNR-MICCAI BraTS 2023 challenge data: voxel-
 segmentation of tumor sub-regions across three cohorts (adult glioma, meningioma,
 pediatric glioma) plus a volume-level 3-class cohort classifier sharing the same encoder.
 
-**Status:** the pipeline is implemented end to end (data → train → inference → post-processing →
-lesion-wise evaluation → confound diagnostics) but **no model has been trained to completion yet**.
-This document is the original plan and design rationale; where the code disagrees, the code wins.
-See `RUNBOOK.md` for the commands and the current state of each step. Known deviations from this
-plan: the classification-confound pre-screen was run, preprocessing/training/evaluation are written
-and unit-tested but not yet run on real data, and Swin UNETR, the site-held-out split and the LRP
-relevance maps are not implemented.
+**Status:** the user reports successful notebook execution on Databricks; this session
+has not independently verified its training metrics or checkpoints. SPCS code and
+local-image preparation are separate from remote GPU acceptance.
+This document includes the original plan and design rationale; where the code disagrees,
+the code wins. See `RUNBOOK.md` for current commands and launch gates. Swin UNETR,
+the site-held-out split, LRP relevance maps and the binarization control's second arm
+remain unimplemented.
+
+**Current SPCS preparation:** `configs/segresnet_spcs.yaml` and `spcs/service_spec.yaml`
+provide an isolated four-rank candidate; Databricks retains its existing recipe.
+Use the approval gates in `RUNBOOK.md` sections 4-6, not the original ML Jobs/admin
+examples below. Local image/testing does not authorize push or paid execution.
+W&B is required-online and numeric-only; checkpoints, images and case-level outputs
+stay in local/Snowflake storage. GPU fit, staged-cache integrity, egress/secret,
+remote telemetry/cost and smoke/full-run approval remain launch gates.
 
 ---
 

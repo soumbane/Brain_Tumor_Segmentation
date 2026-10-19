@@ -1,0 +1,67 @@
+# TEMPLATE ONLY. CARE_ML_RSRCH_GPU_S is NOT verified; no deployment authorized.
+# One process/GPU. Architecture, ROI and precision come from the trusted checkpoint.
+spec:
+  containers:
+    - name: infer
+      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:REQUIRED_IMMUTABLE_TAG
+      command:
+        - python
+        - /app/spcs/supervise.py
+        - --grace
+        - "120"
+        - --
+        - python
+        - -m
+        - brats.evaluate
+        - --split
+        - val
+        - --checkpoint-run-dir
+        - /mnt/output/training/REQUIRED_TRAIN_RUN
+        - --out-dir
+        - /work/evaluation
+        - --publish-dir
+        - /mnt/output/inference/REQUIRED_UNIQUE_EXPORT_RUN
+        - --max-per-cohort
+        - "5"
+      env:
+        OMP_NUM_THREADS: "1"
+        MKL_NUM_THREADS: "1"
+        OPENBLAS_NUM_THREADS: "1"
+        WANDB_MODE: "disabled"
+        BRATS_CACHE_ROOT: /mnt/data
+        BRATS_SPLITS_CSV: /mnt/data/splits/split_random_seed42.csv
+        BRATS_MANIFEST_DIR: /mnt/data/manifest
+        BRATS_MAX_RUNTIME_SECONDS: "REQUIRED_APPROVED_SECONDS"
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+          cpu: 4
+          memory: 20Gi
+        limits:
+          nvidia.com/gpu: 1
+          cpu: 6
+          memory: 24Gi
+      volumeMounts:
+        - name: data
+          mountPath: /mnt/data
+        - name: output
+          mountPath: /mnt/output
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: data
+      source: stage
+      stageConfig:
+        name: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.DATASET_STAGE"
+    - name: output
+      source: stage
+      stageConfig:
+        name: "@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE"
+    - name: work
+      source: local
+  logExporters:
+    eventTableConfig:
+      logLevel: INFO
+  platformMonitor:
+    metricConfig:
+      groups: [system, system_limits, network, storage]
