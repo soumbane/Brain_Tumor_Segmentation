@@ -116,10 +116,20 @@ def test_uploaded_layout_is_what_the_loader_reads(tmp_path):
     assert sorted(r["case_id"] for r in recs) == ["BraTS-GLI-00001-000", "BraTS-PED-00002-000"]
 
 
-def test_smoke_test_looks_where_the_cache_is_mounted():
+def test_smoke_test_uses_audited_train_split_instead_of_arbitrary_cache_glob():
+    import ast
+
     src = submit_job.SMOKE_TEST_PATH.read_text()
     assert "/mnt/data/cache" not in src
-    assert "BRATS_CACHE_ROOT" in src and "**/*.npz" in src
+    tree = ast.parse(src)
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    # The DDP gate shares DataConfig/load_records with training. Unlike a glob,
+    # this cannot accidentally use a protected test case as its first sample.
+    assert any(isinstance(node.func, ast.Name) and node.func.id == "load_records"
+               and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant)
+               and node.args[1].value == "train" for node in calls)
+    assert any(isinstance(node.func, ast.Name) and node.func.id == "verify_audit_identity"
+               for node in calls)
 
 
 def test_there_is_exactly_one_copy_of_each_payload_script():

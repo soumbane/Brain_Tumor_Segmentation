@@ -66,12 +66,13 @@ class CachedBratsDataset(Dataset):
         return self
 
     def _load(self, rec: dict[str, Any]) -> dict[str, Any]:
-        with np.load(rec["cache_path"]) as z:
+        with np.load(rec["cache_path"], allow_pickle=False) as z:
             img = dequantize(z["img"]).astype(np.float32)
             seg = z["seg"] if ("seg" in z.files and self.load_label) else None
             crop_start = z["crop_start"].copy()
             crop_stop = z["crop_stop"].copy()
             orig_shape = z["orig_shape"].copy()
+            affine = z["affine"].copy() if "affine" in z.files else None
 
         item: dict[str, Any] = {
             "image": img,
@@ -82,6 +83,8 @@ class CachedBratsDataset(Dataset):
             "crop_stop": crop_stop,
             "orig_shape": orig_shape,
         }
+        if affine is not None:
+            item["affine"] = affine
         if seg is not None:
             item["label"] = labels_to_regions(seg).astype(np.float32)
         return item
@@ -325,8 +328,12 @@ def seed_worker(worker_id: int) -> None:
     (``set_seed`` offsets by rank) yet reproducible for a fixed ``--seed``.
     """
     info = torch.utils.data.get_worker_info()
-    if info is not None and hasattr(info.dataset, "set_random_state"):
-        info.dataset.set_random_state(seed=info.seed % (2**32))
+    if info is not None:
+        import random
+        random.seed(info.seed)
+        np.random.seed(info.seed % (2**32))
+        if hasattr(info.dataset, "set_random_state"):
+            info.dataset.set_random_state(seed=info.seed % (2**32))
 
 
 def collate_metadata(batch: list[Any]) -> dict[str, Any]:

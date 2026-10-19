@@ -1,0 +1,50 @@
+# Isolated SPCS recipe: candidate 4 x A10G, NOT the Databricks batch-16 recipe.
+# Global batch 8; preserve LR and rank-local Dice / class-weighted DDP CE behavior.
+train:
+  execution_profile: spcs
+  run_name: segresnet_spcs
+  run_id: ''                     # required unique run, supplied at launch
+  attempt_id: ''                 # new for every container launch
+  patch_size: [128, 128, 128]
+  batch_size_per_gpu: 2
+  expected_world_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  val_num_workers: 1
+  val_sw_batch_size: 1
+  amp_dtype: bfloat16
+  epochs: 100
+  warmup_epochs: 8
+  lr: 2.0e-4
+  weight_decay: 1.0e-5
+  optimizer: adamw
+  momentum: 0.99
+  grad_clip: 12.0
+  max_nonfinite_steps: 20
+  seg_loss: dice_ce
+  batch_dice: true
+  lambda_cls: 0.1
+  loss_weighting: fixed
+  pooling: tumor_attention
+  cls_warmup_epochs: 20
+  cohort_balanced_sampling: true
+  val_every: 10
+  val_max_cases: 60
+  seed: 42
+  ckpt_dir: /work/checkpoints
+  artifact_root: /mnt/output/training
+  cache_audit_path: ''           # CPU integrity audit report, required
+  expected_split_sha256: ''      # frozen split digest, required
+  checkpoint_retries: 3
+  max_runtime_seconds: 0         # no implicit paid-run approval
+  shutdown_grace_seconds: 120
+  stage_uri: ''
+  use_mlflow: false
+  wandb: true
+  wandb_project: brats2023
+  wandb_entity: ''               # explicit authorized entity, required
+  wandb_mode: online
+  wandb_group: ''
+  wandb_watch: false
+  require_online_tracking: true
+  numeric_only_tracking: true
