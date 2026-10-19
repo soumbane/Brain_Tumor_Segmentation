@@ -19,7 +19,6 @@ stripping deleted the extracranial part. Boundary-clipped predictions there are
 
 from __future__ import annotations
 
-import argparse
 import logging
 from pathlib import Path
 
@@ -171,115 +170,52 @@ def montage_from_predictions(
     out_dir: Path,
     cfg=None,
     max_per_cohort: int = 8,
-    worst_first: bool = True,
+    worst_first: bool = False,
 ):
-    """Render montages, prioritizing the cases most worth a human's attention.
+    """Render a bounded first-N sample per cohort without retaining any volumes.
 
-    ``worst_first`` sorts labeled cases by ascending WT Dice, because the interesting
-    review targets are the failures, not the many near-perfect cases. For unlabeled
-    cases (official validation) it falls back to cohort-stratified sampling.
+    Worst-first ranking requires a separate compact-score selection pass; it is not
+    silently approximated here. The streaming CLI records its sampling policy.
     """
-    from brats.metrics.lesionwise import legacy_dice
-    from brats.postprocess import PostProcessConfig, postprocess
-
-    cfg = cfg or PostProcessConfig()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    scored: list[tuple[float, dict, dict, dict | None]] = []
-    for pred in predictions:
-        regions = postprocess(pred["probs"], cohort=pred["cohort"], cfg=cfg)
-        gt = None
-        score = 1.0
-        if "label" in pred:
-            gt = {r: pred["label"][i] > 0.5 for i, r in enumerate(REGIONS)}
-            score = legacy_dice(gt["WT"], regions["WT"])
-        scored.append((score, pred, regions, gt))
+    from brats.evaluate import _case_key, _ground_truth
+    from brats.inference import canonical_label_map, restore_channels, validate_geometry
+    from brats.postprocess import PostProcessConfig
 
     if worst_first:
-        scored.sort(key=lambda t: t[0])
-
+        raise ValueError("streaming QC uses first-N per cohort; pass worst_first=False")
+    if max_per_cohort < 0:
+        raise ValueError("max_per_cohort must be nonnegative")
+    cfg = cfg or PostProcessConfig()
+    out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, int] = {}
     paths: list[Path] = []
-    for score, pred, regions, gt in scored:
-        cohort = pred["cohort"]
+    for pred in predictions:
+        cohort, case_id = _case_key(pred)
         if written.get(cohort, 0) >= max_per_cohort:
+            del pred
             continue
+        validate_geometry(pred)
+        if "image" not in pred:
+            raise ValueError("QC requires an MRI image")
+        probs = restore_channels(pred["probs"], pred)
+        label_map, regions = canonical_label_map(probs, cohort, cfg)
+        del label_map
+        gt = _ground_truth(pred)
+        image = restore_channels(pred["image"], pred)
+        path = out_dir / cohort / f"{case_id}.png"
+        case_montage(image, regions, gt, case_id=case_id, cohort=cohort, out_path=path)
         written[cohort] = written.get(cohort, 0) + 1
-
-        note = f"WT Dice {score:.3f}" if gt is not None else ""
-        path = out_dir / cohort / f"{pred['case_id']}.png"
-        case_montage(
-            image=pred["image"] if "image" in pred else pred["probs"],
-            pred_regions=regions,
-            gt_regions=gt,
-            case_id=pred["case_id"],
-            cohort=cohort,
-            out_path=path,
-            dice_note=note,
-        )
         paths.append(path)
-
+        del pred, probs, regions, gt, image
     log.info("wrote %d montages to %s", len(paths), out_dir)
     return paths
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", default="configs/segresnet_base.yaml")
-    ap.add_argument("--data-config", default=None)
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--split", default="official_val",
-                    choices=["val", "test", "official_val"])
-    ap.add_argument("--postproc-config", default=None,
-                    help="post-processing / inference YAML (default: configs/postproc.yaml)")
-    ap.add_argument("--max-per-cohort", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--out-dir", default=None)
-    args = ap.parse_args(argv)
+    """Share inference settings, split protection, geometry and publication with export."""
+    from brats.evaluate import main as evaluate_main
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
-
-    import torch
-
-    from brats.config import DataConfig
-    from brats.data.transforms import CachedBratsDataset, load_records, val_transforms
-    from brats.inference import inference_config_from_yaml, predict_dataset
-    from brats.postprocess import DEFAULT_POSTPROC_YAML, PostProcessConfig
-    from brats.models.multitask import MultiTaskConfig, load_model_from_checkpoint
-    from brats.train import TrainConfig
-
-    cfg = TrainConfig.from_yaml(args.config)
-    data_cfg = DataConfig.load(args.data_config) if args.data_config else DataConfig.load()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = Path(args.out_dir) if args.out_dir else (
-        data_cfg.reports_dir / f"qc_{args.split}"
-    )
-
-    model = load_model_from_checkpoint(
-        args.checkpoint,
-        fallback=MultiTaskConfig(pooling=cfg.pooling),  # type: ignore[arg-type]
-    ).to(device)
-
-    labeled = args.split != "official_val"
-    ds = CachedBratsDataset(
-        load_records(data_cfg, args.split),
-        transform=val_transforms(labeled),
-        load_label=labeled,
-    )
-
-    preds = []
-    pp_cfg = PostProcessConfig.from_yaml(args.postproc_config or DEFAULT_POSTPROC_YAML)
-    # Montages are for eyeballing, so TTA stays off regardless of the YAML.
-    inf_cfg = inference_config_from_yaml(args.postproc_config, roi_size=cfg.patch_size, tta="none")
-    for i, pred in enumerate(
-        predict_dataset(model, ds, cfg=inf_cfg, device=device, limit=args.limit)
-    ):
-        # Carry the image through so the montage can draw on it.
-        pred["image"] = np.asarray(ds[i]["image"])
-        preds.append(pred)
-
-    montage_from_predictions(preds, out_dir, cfg=pp_cfg, max_per_cohort=args.max_per_cohort)
-    return 0
+    return evaluate_main(argv, qc_only=True)
 
 
 __all__ = ["case_montage", "montage_from_predictions", "REGION_COLORS"]

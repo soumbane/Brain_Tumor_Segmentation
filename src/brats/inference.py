@@ -54,6 +54,118 @@ class InferenceConfig:
 
     extra: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if len(self.roi_size) != 3 or any(int(v) != v or v <= 0 for v in self.roi_size):
+            raise ValueError("roi_size must contain three positive integers")
+        if self.sw_batch_size <= 0 or not 0 <= self.overlap < 1:
+            raise ValueError("sw_batch_size must be positive and overlap in [0, 1)")
+        if self.mode not in {"constant", "gaussian"}:
+            raise ValueError("inference mode must be constant or gaussian")
+        if self.amp_dtype not in {torch.bfloat16, torch.float16, torch.float32}:
+            raise ValueError("inference precision must be bfloat16, float16 or float32")
+
+
+def inference_config_from_checkpoint(
+    state: dict,
+    path: str | Path | None = None,
+    *,
+    fallback: dict | None = None,
+    override: bool = False,
+    tta: str | None = None,
+) -> InferenceConfig:
+    """Use checkpoint patch/precision; legacy fallback or override must be explicit.
+
+    ``state`` is a trusted, locally loaded checkpoint. A partial checkpoint config
+    may use only explicitly supplied fallback values, never implicit YAML defaults.
+    """
+    saved = state.get("config") or {}
+    effective = dict(fallback or {}) if override else {**(fallback or {}), **saved}
+    missing = {"patch_size", "amp_dtype"} - effective.keys()
+    if missing:
+        raise ValueError(f"checkpoint lacks {sorted(missing)}; explicit legacy config required")
+    precision = effective["amp_dtype"]
+    dtypes = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    if precision not in dtypes:
+        raise ValueError(f"unsupported checkpoint amp_dtype: {precision!r}")
+    cfg = inference_config_from_yaml(path, roi_size=tuple(effective["patch_size"]), tta=tta)
+    cfg.amp_dtype = dtypes[precision]
+    cfg.extra["training_settings_source"] = (
+        "explicit_override" if override else
+        "checkpoint" if {"patch_size", "amp_dtype"} <= saved.keys() else "explicit_legacy_fallback"
+    )
+    cfg.__post_init__()
+    return cfg
+
+
+def require_test_acknowledgement(split: str, acknowledged: bool) -> None:
+    if split == "test" and not acknowledged:
+        raise SystemExit(
+            "Refusing to open the internal test split without "
+            "--i-understand-this-opens-the-test-split. Freeze all settings on validation first."
+        )
+
+
+def validate_geometry(pred: dict) -> tuple[tuple[int, int, int], np.ndarray, np.ndarray, np.ndarray]:
+    """Require invertible original-grid metadata and the metric's orthogonal 1-mm grid."""
+    vectors = []
+    for key in ("orig_shape", "crop_start", "crop_stop"):
+        value = np.asarray(pred[key])
+        if value.shape != (3,) or not np.isfinite(value).all() or not np.equal(value, np.floor(value)).all():
+            raise ValueError(f"invalid {key}: expected three finite integers")
+        vectors.append(value.astype(np.int64))
+    shape, start, stop = vectors
+    if np.any(shape <= 0) or np.any(stop <= start):
+        raise ValueError("invalid original shape or crop extents")
+    if np.any(np.minimum(stop, shape) <= np.maximum(start, 0)):
+        raise ValueError("crop does not intersect the original grid")
+    probs = np.asarray(pred["probs"])
+    if probs.shape != (N_REGIONS, *tuple(stop - start)):
+        raise ValueError("probability shape does not match crop extents")
+    if not np.isfinite(probs).all() or np.any((probs < 0) | (probs > 1)):
+        raise ValueError("probabilities must be finite and in [0, 1]")
+    if "label" in pred and np.asarray(pred["label"]).shape != probs.shape:
+        raise ValueError("ground-truth shape does not match probabilities")
+    if "affine" not in pred:
+        raise ValueError("original affine is required for export; no identity fallback")
+    affine = np.asarray(pred["affine"], dtype=np.float64)
+    if affine.shape != (4, 4) or not np.isfinite(affine).all():
+        raise ValueError("affine must be a finite 4x4 matrix")
+    if not np.allclose(affine[3], (0, 0, 0, 1)) or abs(np.linalg.det(affine[:3, :3])) < 1e-8:
+        raise ValueError("affine must be nonsingular and homogeneous")
+    if not np.allclose(affine[:3, :3].T @ affine[:3, :3], np.eye(3), atol=1e-4, rtol=1e-4):
+        raise ValueError("postprocessing and HD95 require an orthogonal 1-mm voxel grid")
+    return tuple(int(v) for v in shape), start, stop, affine
+
+
+def restore_channels(volume: np.ndarray, pred: dict) -> np.ndarray:
+    """Discard padding while restoring channel-first data to the original grid."""
+    from brats.postprocess import paste_into_original
+
+    volume = np.asarray(volume)
+    expected_shape = tuple(np.asarray(pred["crop_stop"]) - np.asarray(pred["crop_start"]))
+    if volume.ndim != 4 or volume.shape[1:] != expected_shape:
+        raise ValueError("channel-first volume shape does not match crop geometry")
+    shape = tuple(int(v) for v in pred["orig_shape"])
+    restored = np.empty((volume.shape[0], *shape), dtype=volume.dtype)
+    for index, channel in enumerate(volume):
+        restored[index] = paste_into_original(channel, shape, pred["crop_start"], pred["crop_stop"])
+    return restored
+
+
+def canonical_label_map(probs: np.ndarray, cohort: str, cfg) -> tuple[np.ndarray, dict]:
+    """Postprocess original-grid probabilities and score the representable export masks.
+
+    Label-map serialization necessarily nests regions, even when a research ablation
+    disables nesting. Deriving masks from the final map prevents export/score drift.
+    """
+    from brats.data.preprocess import labels_to_regions
+    from brats.constants import REGIONS
+    from brats.postprocess import postprocess, regions_to_label_map
+
+    label_map = regions_to_label_map(postprocess(probs, cohort=cohort, cfg=cfg))
+    regions = labels_to_regions(label_map).astype(bool)
+    return label_map, dict(zip(REGIONS, regions, strict=True))
+
 
 def inference_config_from_yaml(
     path: str | Path | None = None,
@@ -180,7 +292,7 @@ def predict_volume(
     cls_logit_sum = torch.zeros(N_COHORTS, dtype=torch.float64)
     cls_weight_sum = 0.0
 
-    use_amp = torch.device(device).type == "cuda"
+    use_amp = torch.device(device).type == "cuda" and cfg.amp_dtype != torch.float32
     for axes in flips:
         wrapper.reset()
         x = torch.flip(image, dims=list(axes)) if axes else image
@@ -230,22 +342,28 @@ def predict_volume(
     }
 
 
-@torch.no_grad()
 def predict_dataset(
     model: nn.Module,
     dataset,
     cfg: InferenceConfig | None = None,
     device: torch.device | str = "cuda",
     limit: int | None = None,
+    include_image: bool = False,
 ):
     """Yield per-case predictions for a dataset.
 
     Yields dicts with ``case_id``, ``cohort``, ``probs``, ``cls_probs``, the crop
     geometry needed to paste back into the original grid, and ``label`` when present.
+    ``predict_volume`` owns no-grad; decorating this generator would retain its
+    previously yielded volume while requesting the next item.
     """
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
     n = len(dataset) if limit is None else min(limit, len(dataset))
     for i in range(n):
         item = dataset[i]
+        if "affine" not in item:
+            raise ValueError("cached case is missing its original affine")
         out = predict_volume(model, item["image"], cfg=cfg, device=device)
         rec = {
             "case_id": item["case_id"],
@@ -257,10 +375,16 @@ def predict_dataset(
             "crop_stop": np.asarray(item["crop_stop"]),
             "orig_shape": np.asarray(item["orig_shape"]),
         }
+        rec["affine"] = np.asarray(item["affine"])
+        if include_image:
+            rec["image"] = np.asarray(item["image"])
         if "label" in item:
             lab = item["label"]
             rec["label"] = lab.numpy() if isinstance(lab, Tensor) else np.asarray(lab)
+            del lab
+        del item, out
         yield rec
+        del rec  # release the preceding volume before loading the next case
         if (i + 1) % 25 == 0:
             log.info("inference %d/%d", i + 1, n)
 
@@ -268,6 +392,11 @@ def predict_dataset(
 __all__ = [
     "InferenceConfig",
     "inference_config_from_yaml",
+    "inference_config_from_checkpoint",
+    "validate_geometry",
+    "restore_channels",
+    "canonical_label_map",
+    "require_test_acknowledgement",
     "predict_volume",
     "predict_dataset",
     "eight_flip_axes",
