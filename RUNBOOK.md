@@ -88,6 +88,102 @@ evidence of confounding, not of a good model.
 
 ## 3. Preprocess and cache
 
+### Isolated repair and source verification
+
+Use `scripts/rebuild_cache.py` for a previously truncated cache. It requires a new
+local output directory and the exact frozen split SHA256. `--reuse-cache` may point
+to an earlier incomplete repair, but existence is not sufficient: each candidate
+must pass the mechanical audit and voxelwise original-source round-trip before it
+is copied. Missing or invalid candidates are rebuilt from original NIfTI. Source
+files, reuse candidates, manifests and splits are hash-checked for changes. No
+existing cache, source image, label or split is overwritten, and no upload or
+training is performed.
+
+The crop remains image-derived unless it would discard an annotation; then the
+box expands to contain image and label support. Normalization still uses only the
+MRI nonzero union. Annotations outside that MRI mask are preserved and reported,
+not erased or used to change image intensities. This is a data-preservation step,
+not annotation correction or test-set tuning. Official validation remains unlabeled.
+
+The output contains `cache/{GLI,MEN,PED}/*.npz`, `cache_index.csv`, and
+`repair-report.json` with per-case source hashes, actions and round-trip results.
+`cache-audit.json` is the completion marker and is written last only after exact
+coverage and all checks pass. A failed report is not a usable training audit.
+Never point training at the older `_cache` or an incomplete repair merely because
+its file count appears correct. These preprocessing changes do not alter the NPZ
+encoding consumed by the trainer; source provenance must still distinguish the
+repair checkout from the already-built runtime image.
+
+Completed October 26, 2026: the isolated cache at
+`C:\data\brats2023\_cache_verified_20261026\dataset\cache` passed all 2,755
+original-source round-trips and the complete mechanical audit (GLI 1,470;
+MEN 1,141; PED 144). 2,754 files were copied from the previous repair only after
+verification; `BraTS-MEN-00781-010` was rebuilt to preserve its excluded label.
+The completed cache is 12,026,760,158 bytes. Source labels outside the MRI nonzero
+mask were retained in 32 cases (327 voxels), not silently corrected. The maximum
+normalized intensity round-trip error was 0.0196863 sigma. Original manifests and
+frozen split bytes remained unchanged.
+
+Audit: `C:\data\brats2023\_cache_verified_20261026\dataset\cache-audit.json`.
+Dataset identity: `e0b7fe2fb085ceddc298ee76e7edaf18c5a6e3e9b1ab84e57f542ee7206ecb13`.
+The sibling `repair-report.json` and `repair-provenance.json` record per-case and
+execution evidence. The existing uploaded `spcs-20261026-runtime1` image's baked
+`verify_audit_identity` successfully checked every repaired NPZ against this audit;
+the encoding is compatible without changing the training reader. The new repair
+code is not baked into that image. Local regression suite: 305 passed, 3 skipped.
+
+### Verified Snowflake upload (October 26, 2026)
+
+Uploaded all 2,755 repaired NPZ files (12,026,760,158 bytes), the three unchanged
+manifest files, and the frozen split without recompression or overwrite. Every
+uploaded file was downloaded to separate local storage and its exact size and
+SHA256 checked against the completed audit/metadata hashes. All 2,759 passed.
+The pre-existing stage inventory, including sizes, checksums and timestamps,
+was unchanged. No GPU pool was resumed and no training job was submitted.
+The exact uploaded runtime image (digest
+`sha256:9f1378954e83d1fa4d9763726becd65791757bda80aeffd706010467873e41cf`)
+also passed `verify_audit_identity` using only these downloaded cache, metadata,
+split and audit bytes, with networking disabled and no checkout source override.
+This establishes data/reader compatibility, not live GPU or stage-mount behavior.
+
+Dataset prefix:
+`@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.DATASET_STAGE/versions/cache-20261026-e0b7fe2fb085/`
+contains `cache/{GLI,MEN,PED}/`, `manifest/`, and `splits/`.
+
+Audit:
+`@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE/audits/cache-20261026-e0b7fe2fb085/cache-audit.json`
+was published only after remote data verification. The same output prefix holds
+`repair-report.json`, `repair-provenance.json`, `cache_index.csv`, and
+`upload-receipt.json`; each was downloaded and SHA256-verified. Repair provenance
+is the unchanged pre-upload snapshot; the upload receipt records publication.
+Audit SHA256: `49b561138e2dc53c9d77d32e75fde5b7df05227b0db7f7f85c5d37c5a196f364`.
+Receipt SHA256: `92b1f98925c32ebb6ba1d5b4a2dfe6434680ee854322ba0e0eb61ac1902520fe`.
+Local transfer evidence:
+`C:\data\brats2023\_cache_verified_20261026\upload-20261026-e0b7fe2fb085\`.
+
+For the existing stage mounts, the next rendered specification must use:
+
+```yaml
+BRATS_CACHE_ROOT: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/cache"
+BRATS_MANIFEST_DIR: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/manifest"
+BRATS_SPLITS_CSV: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/splits/split_random_seed42.csv"
+BRATS_CACHE_AUDIT_PATH: "/mnt/output/audits/cache-20261026-e0b7fe2fb085/cache-audit.json"
+BRATS_EXPECTED_SPLIT_SHA256: "3e0efe90585fbb98be94f2035901d646a012a472090c8a9153344528df55f51e"
+```
+
+Do not use `/mnt/data` as the cache root: it now contains both old and versioned
+NPZ files, so exact coverage verification will reject it. The subsequent local
+specification update sets all five values above and references the already-uploaded
+`spcs-20261026-runtime1` image. Its updated preparation template was uploaded to
+`@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.SPECS_STAGE/prepared/cache-20261026-e0b7fe2fb085-runtime1/service_spec.yaml`
+and downloaded for SHA256 verification:
+`d59eb361b41f78d66d5c78774602d9950877b192c2d6e38dea8f4b7af96913fb`.
+Older staged specifications remain unchanged. This template still contains run,
+attempt and deadline placeholders; render a separate launch specification before
+submission. No training has started.
+
+Historical initial-cache commands (not the isolated repair workflow):
+
 ```powershell
 # Verify the quantization round-trip on 4 cases first.
 .venv\Scripts\python.exe -m brats.data.preprocess --limit 4 --verify
@@ -179,15 +275,83 @@ Final rebuild must happen after all source edits, under another immutable tag.
 Python 3.11/3.12, imports, model forward/backward, image platform and pinned SDK
 settings must pass; CPU success does not establish GPU driver/NCCL compatibility.
 
-Before any remote action, resolve these gates:
+### Prepare specifications without starting a job
 
-- `/guardrails`: current Restricted Session Scope blocks the EAI inspection.
-  Do not bypass by role changes, removing restrictions, or alternate CLI SQL.
-- Explicit W&B entity, project `brats2023`, and securely provisioned project
-  SECRET injected into `WANDB_API_KEY` through `containers.secrets`. Values go
-  through `/secrets`, never chat/spec/build args or source. Local secret storage
-  is not Snowflake SECRET provisioning. First verify project-role CREATE SECRET
-  and READ/ownership; do not assume ACCOUNTADMIN is necessary.
+The image `brats-train:spcs-20261026-runtime1` has been pushed and its registry
+index digest reverified on October 26 as
+`sha256:9f1378954e83d1fa4d9763726becd65791757bda80aeffd706010467873e41cf`.
+The external `spcs/service_spec.yaml` now references that image and the confirmed
+W&B entity `banerjee-s-corewell`. The supplied project page is
+<https://forge.coreweave.com/wandb/banerjee-s-corewell/brats2023>.
+This browser URL is not an SDK API endpoint: do not set `WANDB_BASE_URL` to it.
+Confirm the SDK endpoint/egress with the workspace configuration before launch.
+
+`spcs/prepare_job.py` renders local YAML only. It cannot authenticate, upload,
+create a secret, resume a pool, or submit a job. It requires an explicit mode,
+existing SECRET object name (not the key), completed audit path, frozen split
+SHA256 and runtime limit; missing values/placeholders fail instead of defaulting.
+Generated run/attempt IDs are unique, and existing output files are never replaced.
+The renderer validates input syntax, **not** remote existence, privileges or audit
+contents; the training image rechecks current NPZ hashes against the audit.
+
+Create an ignored local output directory with `mkdir -p runs/spcs`. In the example
+below, replace the uppercase input tokens with verified values; the example is
+intentionally not runnable unchanged. Use the existing image as the local Python
+runtime, with networking disabled:
+
+```bash
+docker run --rm --network none --platform linux/amd64 \
+  -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/repo:ro" \
+  -v "$PWD/runs/spcs:/prepared" brats-train:spcs-20261026-runtime1 \
+  python /repo/spcs/prepare_job.py --mode smoke \
+  --secret-name CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.WANDB_API_KEY \
+  --cache-audit-path /mnt/output/audits/VERIFIED_AUDIT.json \
+  --split-sha256 VERIFIED_64_CHARACTER_SPLIT_SHA256 \
+  --runtime-seconds APPROVED_SMOKE_SECONDS \
+  --output /prepared/smoke.yaml
+```
+
+This prepares the dedicated four-rank GPU smoke harness, **not** the 100-epoch
+trainer. The default is two updates per attention phase (six per rank) and one
+validation volume. It retains full128/batch2/bf16, strict online tracking, and the
+same stage mounts. `--smoke-lambda-cls 0.0` prepares the separate classifier-disabled
+smoke gate. `--interrupt-after-publication` prepares deliberate exit 75 after a
+completed checkpoint. For recovery, render another file with `--resume --run-id`
+set to the original smoke ID; a new attempt ID is generated. Do not change modes,
+lambda, or update counts when resuming the same run.
+
+After smoke acceptance and a separate full-run decision, prepare full training by
+using `--mode train`, its own explicit runtime limit, and a different output file.
+That spec retains 100 epochs, validation every 10 epochs, and a fresh non-smoke
+run prefix. There is no automatic promotion or submission. Resume only an existing
+run of the same mode with a new attempt ID. The supervisor's TERM/KILL grace can
+extend beyond its runtime timer; the external hard deadline must allow for that
+and independently cover queueing/image pull.
+
+These are **external launch-file changes**: the pushed image already supports
+the environment overrides and both entry points. No rebuild/push is needed to
+use the rendered YAML. Its bundled template is older; render from the checkout
+(`/repo/spcs/prepare_job.py` above), not from `/app/spcs` in that image.
+
+At eventual submission, attach `CARE_ML_RSRCH_INTERNET_EAI` using the job's
+`EXTERNAL_ACCESS_INTEGRATIONS` property, not an invented YAML field. Upload/rendering
+alone does not attach egress. No submission command is executed by this helper.
+
+Before any job launch, resolve these gates:
+
+- Check the active `/guardrails` scope before restricted operations. The earlier
+  session blocked EAI inspection; the credential-setup session on October 26, 2026
+  reported no active RSS. This does not verify EAI privileges or allowed hosts.
+  Do not bypass a restriction by changing roles or using alternate CLI SQL.
+- The W&B entity is `banerjee-s-corewell`, project `brats2023`. On October 26, 2026,
+  `CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.WANDB_API_KEY` was created as GENERIC_STRING
+  and its ownership by `SFK_CARE_ML_RSRCH_ADM` verified without retrieving its value.
+  The generic secret can be referenced by other experiments with appropriate
+  parent-object and secret access; no additional roles were granted access here.
+  The local specification injects it into `WANDB_API_KEY` through `containers.secrets`.
+  Credentials must enter through a secure masked/no-echo prompt, never chat,
+  spec/build arguments or source. Local credential storage and Snowflake SECRET
+  provisioning are separate. Creation does not prove W&B authentication or delivery.
 - Verify `CARE_ML_RSRCH_INTERNET_EAI` usage, job attachment, required W&B API and
   signed-upload hosts, and exact create/observe/cancel privileges using
   `SFK_CARE_ML_RSRCH_ADM`. No wildcard egress or TLS bypass.
@@ -245,6 +409,141 @@ then keep observing until terminal and confirm no running containers. An API
 error or missing log is not proof of termination. The helper intentionally does
 not execute unverified SQL or cancel anything while scope/permissions are
 unresolved. Operator presence is mandatory until a remote watcher is verified.
+
+### Current operator launch steps (prepared, not executed)
+
+The current image, repaired data, frozen split and audit are uploaded and verified.
+The research role passed `EXPLAIN_PRIVILEGES` for job submission; GPU_M remains
+suspended with zero jobs, and the W&B secret exists. The EAI is enabled and the
+role has USAGE. Its network-rule host list is still not inspectable by this role.
+Actual GPU fit/NCCL, W&B authentication/history delivery, stage-mounted persistence
+and forced-interruption recovery remain unverified. The SQL tool's compile-only
+wrapper cannot compile `EXECUTE JOB SERVICE` (it rejected `EXECUTE`); the privilege
+check is not service-spec validation or scheduling evidence. No launch was attempted.
+
+A concrete first-smoke candidate is already rendered locally at
+`runs/spcs-20261026-runtime1/smoke.yaml`. It uses the new image and verified data,
+a generated `smoke-f8bd16af7f7645b198e04973158a684f` run ID, a unique attempt ID,
+and a **proposed** 1,800-second container runtime limit. Rendering is not paid-run
+approval. The stage file under `prepared/.../service_spec.yaml` remains a template;
+do not launch it directly. Snowflake CLI can submit the rendered local YAML instead.
+
+#### 1. Start the first smoke only when accepting its cost and deadlines
+
+Proposed operator limits: cancel if not RUNNING within 15 minutes of submission;
+cancel if not terminal within 50 minutes of submission. These are manual operator
+deadlines, not provisioned Snowflake limits or a credit cap. The container's own
+30-minute timer starts after image pull and can add 120 seconds of shutdown grace.
+Record submission time and stay present, observing at least once a minute. Capture
+the job owner/created_on from DESCRIBE before any cancellation. Do not suspend the
+shared pool to stop your individual job.
+
+Run from WSL using the installed Windows Snowflake CLI. The `--spec-path` must be
+a Windows path, not `/mnt/c/...`. The following command **starts paid GPU compute**:
+
+```bash
+SNOW="/mnt/c/Program Files/Snowflake CLI/snow.exe"
+REPO_WIN="C:/Users/SOU66793/OneDrive - Corewell Health/Desktop/Projects/Brain_Tumor_MRI"
+JOB="CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.BRATS_SMOKE_F8BD16AF7F7645B198E04973158A684F"
+CONNECTION=(--connection corewell-ml --authenticator externalbrowser --role SFK_CARE_ML_RSRCH_ADM --database CARE_ML_RESEARCH_WKSP --schema BRAIN_TUMOR_SEG)
+"$SNOW" spcs service execute-job "$JOB" \
+  --compute-pool CARE_ML_RSRCH_GPU_M \
+  --spec-path "$REPO_WIN/runs/spcs-20261026-runtime1/smoke.yaml" \
+  --eai-name CARE_ML_RSRCH_INTERNET_EAI --async "${CONNECTION[@]}"
+```
+
+Submit this candidate once only. A repeat/recovery attempt requires a newly rendered
+specification, new job name and attempt ID; retain the run ID only for explicit resume.
+Do not set four replicas: the one instance already starts four local DDP ranks.
+No manual pool resume is needed when its verified `auto_resume=true` remains set.
+
+#### 2. Observe it and cancel only that job if necessary
+
+```bash
+"$SNOW" spcs service describe "$JOB" "${CONNECTION[@]}"
+"$SNOW" spcs service list-containers "$JOB" "${CONNECTION[@]}"
+"$SNOW" spcs service logs "$JOB" --container-name train --instance-id 0 \
+  --num-lines 200 "${CONNECTION[@]}"
+```
+
+For an expired deadline, stuck job or manual stop, run the following in Snowsight
+as `SFK_CARE_ML_RSRCH_ADM`, after confirming this is the exact job you submitted:
+
+```sql
+SELECT CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.BRATS_SMOKE_F8BD16AF7F7645B198E04973158A684F!SPCS_CANCEL_JOB();
+```
+
+The documented helper requires OPERATE on the job (normally available to its owning
+role); its invocation cannot be verified until the job exists. Keep checking DESCRIBE
+and container state until cancellation/completion is confirmed. Do not assume closing
+the terminal or cancelling the returned asynchronous SQL query stops the GPU job.
+
+Accept the first smoke only after status DONE, a
+`gpu_compute_and_checkpoint_gate_passed` log, six successful updates per rank,
+four peak-VRAM values, a hash-complete checkpoint bundle under
+`@CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.OUTPUT_STAGE/training/smoke-f8bd16af7f7645b198e04973158a684f/`,
+and visible numeric W&B history for the generated run. Inspect W&B's file inventory
+for the privacy contract; SDK init/finish alone does not prove delivery. The smoke
+logs successful-update history to W&B; its validation/VRAM metrics are in the stage
+checkpoint evidence, not a demonstration of full training-loss curves.
+
+Complete the separately described classifier-disabled and recovery gates before
+calling full training validated. `--interrupt-after-publication` is a controlled
+exit after publication, not the forced mid-next-epoch interruption test.
+
+#### 3. Prepare full training only after acceptance and a duration decision
+
+The 100-epoch duration is not measured yet. Choose the limit after inspecting the
+smoke and accounting for full epochs, 50-volume validation and checkpoint I/O;
+do not interpret the smoke's 30-minute limit as a full-run limit. A smoke alone is
+not a precise full-run cost forecast. The limit applies to one attempt; recovery
+continues from the last completed epoch with `--resume` and a new attempt ID.
+
+From WSL, render a fresh full-training file (this command is local-only):
+
+```bash
+REPO="/mnt/c/Users/SOU66793/OneDrive - Corewell Health/Desktop/Projects/Brain_Tumor_MRI"
+read -r -p "Approved full-training attempt limit in seconds (>120): " TRAIN_SECONDS
+docker run --rm --network none --platform linux/amd64 \
+  -e PYTHONDONTWRITEBYTECODE=1 -v "$REPO:/repo:ro" \
+  -v "$REPO/runs/spcs-20261026-runtime1:/prepared" \
+  brats-train@sha256:9f1378954e83d1fa4d9763726becd65791757bda80aeffd706010467873e41cf \
+  python /repo/spcs/prepare_job.py --mode train \
+  --secret-name CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.WANDB_API_KEY \
+  --cache-audit-path /mnt/output/audits/cache-20261026-e0b7fe2fb085/cache-audit.json \
+  --split-sha256 3e0efe90585fbb98be94f2035901d646a012a472090c8a9153344528df55f51e \
+  --runtime-seconds "$TRAIN_SECONDS" --output /prepared/train.yaml
+```
+
+Check that rendering succeeded and record its generated run/attempt IDs. If the
+file already exists, the renderer refuses to overwrite; use a new filename and
+review which attempt you mean to launch. Then, **only after approving this run**:
+
+```bash
+JOB="CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.BRATS_TRAIN_$(date -u +%Y%m%d_%H%M%S)"
+"$SNOW" spcs service execute-job "$JOB" \
+  --compute-pool CARE_ML_RSRCH_GPU_M \
+  --spec-path "$REPO_WIN/runs/spcs-20261026-runtime1/train.yaml" \
+  --eai-name CARE_ML_RSRCH_INTERNET_EAI --async "${CONNECTION[@]}"
+```
+
+Use the same observe commands with the new `$JOB`, and set explicit startup/hard
+operator deadlines for this attempt. Job names and artifact run IDs are distinct.
+For cancellation use `<exact full-training job FQN>!SPCS_CANCEL_JOB()`, not the smoke
+name. No `--resume` is used on this fresh run.
+
+Full training remains 100 epochs, BF16, 128-cubed patches, batch 2/rank (global 8),
+validation at epochs 10,20,...,100 on 50 cases (GLI 20/MEN 20/PED 10), and checkpoints
+after each completed epoch. Training losses, validation ET/TC/WT Dice and cohort
+accuracy, LR, timings and runtime metrics are logged. **Validation loss is not
+implemented.** W&B is `banerjee-s-corewell/brats2023`; MRI, case identifiers, code
+and checkpoints stay in local/Snowflake storage. Full-training artifacts publish
+under `OUTPUT_STAGE/training/<generated-train-run-id>/`.
+
+References: [execute-job CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/command-reference/spcs-commands/service-commands/execute-job),
+[job cancellation](https://docs.snowflake.com/en/sql-reference/functions/spcs_cancel_job).
+These instructions were checked against CLI 3.16.0 help and current documentation;
+the launch, monitoring and cancellation commands were not executed on a live job.
 
 ## 6. Tracking, observability and the full-run decision
 
@@ -370,27 +669,34 @@ number** — n≈10 there, and differences under 0.05 Dice are noise.
 
 Historical local data reports below have not been regenerated in this session.
 The user reports a successful Databricks notebook run; its metrics/checkpoints
-were not independently inspected. The current SPCS image is
+were not independently inspected. The original SPCS image was
 `brats-train:spcs-20261015-local2` (linux/amd64), with Python 3.12.3,
 PyTorch 2.13.0+cu126, MONAI 1.6.1 and W&B 0.23.0. Dependency checks and a CPU
-model forward/backward pass succeeded. No registry push, remote W&B run or
+model forward/backward pass succeeded. The versioned image was subsequently pushed
+and its registry digest verified; `latest` was left unchanged. No remote W&B run or
 paid GPU job was performed. Independent final-review workers could not start
 (`ENOENT: uv_cwd`); the parent performed the final review instead.
+The subsequent local launch-preparation changes passed 277 tests (3 skipped)
+using this image with the checkout mounted and networking disabled. That does
+not verify Snowflake permissions, staged-cache integrity, or live W&B delivery.
+The October 26 credential-only update created the generic W&B secret and updated
+its external specification reference; 37 deployment/preparation tests passed
+with networking disabled. No spec upload or job submission accompanied that update.
 
 | Step | State |
 |---|---|
 | 0. Environment | SPCS local image validated as above; host Python 3.14 is outside the supported project range |
 | 0. `external/brats_metrics` clone | **not done** — needed before reporting any number |
-| 0. Snowflake launch | **blocked** - scoped EAI inspection, secret/entity, telemetry/cost and explicit paid-job approval remain |
+| 0. Snowflake launch | **Smoke candidate prepared, not submitted** - runtime1 image and updated template, repaired dataset/audit, secret and launch-privilege checks complete; GPU/W&B/recovery acceptance and full-run deadline/spend decision remain |
 | 1a. Extract | **done** — 2755 cases: GLI 1251/219, MEN 1000/141, PED 99/45, all counts exact |
 | 1b. Manifest | **done, PASSED** — 0 label-4s, labels exactly {0,1,2,3}, 0 integrity errors |
 | 1c. Splits | **done, committed** — `splits/split_random_seed42.csv`, 0 patient leakage |
 | 2. Confound pre-screen | **done** — mask geometry alone reaches 0.769 balanced acc (chance 0.333) |
-| 3. Preprocess cache | **NOT RUN here** — re-run with `--overwrite --verify` if built before the z-crop fix |
-| 6. Train / 7. Evaluate | Final baked SPCS image: 250 CPU tests passed, 3 skipped; distributed CUDA execution remains unverified |
+| 3. Preprocess cache | **Repair and upload PASSED** - 2,755 source-verified cases uploaded under `DATASET_STAGE/versions/cache-20261026-e0b7fe2fb085/cache/`; every remote file downloaded and SHA256-verified; old cache preserved |
+| 6. Train / 7. Evaluate | Uploaded runtime1 image: 282 tests passed, 3 skipped at build; current image-reference update: 37 focused tests passed; distributed CUDA execution remains unverified |
 | Lesion-wise metric | Internal approximate HD95; official-reference tests skipped because the reference repository is absent |
 | SPCS rollout | No remote launch; follow sections 4-6, including cache audit and bounded GPU smoke |
 
 The historical pre-screen numbers above used patient-leaky CV and should be rerun
-before scientific interpretation. Do not regenerate the frozen split. Validate
-the existing staged cache before deciding whether preprocessing repair is needed.
+before scientific interpretation. Do not regenerate the frozen split. Use the
+verified versioned cache and audit from section 3, not the preserved original cache.
