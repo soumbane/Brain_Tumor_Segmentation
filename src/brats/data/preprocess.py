@@ -4,7 +4,9 @@ Preprocessing is deliberately minimal, matching what every BraTS 2023 top team d
 
 1. **Stack** the 4 sequences in canonical ``(t1n, t1c, t2w, t2f)`` order.
 2. **Crop** to the nonzero brain bounding box plus a margin (~40% volume reduction),
-   rounded up to a multiple of ``size_divisor`` so the encoder's downsampling levels
+   expanding only if necessary to preserve annotations outside that box. The MRI-only
+   mask still defines normalization; annotation values never alter intensities. Round
+   up to a multiple of ``size_divisor`` so the encoder's downsampling levels
    and sliding-window inference never meet a ragged edge. Where rounding up overruns
    the volume (the z axis: 155 -> 160) the box extends past the end and is
    zero-padded, so ``crop_stop`` can exceed ``orig_shape``. Cropping asserts that no
@@ -190,6 +192,47 @@ def crop_pad(arr: np.ndarray, box: tuple[slice, slice, slice]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def _load_source(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Load canonical MRI channels and reject inconsistent geometry or labels."""
+    volumes = []
+    affine = None
+    shape = None
+    for sequence in SEQUENCES:
+        volume = nib.load(row[f"path_{sequence}"])
+        values = np.asanyarray(volume.dataobj).astype(np.float32)
+        current_affine = np.asarray(volume.affine, dtype=np.float64)
+        if (values.ndim != 3 or not np.isfinite(values).all()
+                or not np.isfinite(current_affine).all()
+                or abs(np.linalg.det(current_affine[:3, :3])) < 1e-8):
+            raise ValueError(f"{row['case_id']}: invalid {sequence} data or affine")
+        if affine is None:
+            affine, shape = current_affine, values.shape
+        elif values.shape != shape or not np.allclose(current_affine, affine, atol=1e-4, rtol=0):
+            raise ValueError(f"{row['case_id']}: {sequence} geometry differs from first image")
+        volumes.append(values)
+    seg = None
+    seg_path = row.get("path_seg")
+    if isinstance(seg_path, str) and seg_path:
+        volume = nib.load(seg_path)
+        values = np.asanyarray(volume.dataobj)
+        if values.shape != shape or not np.allclose(volume.affine, affine, atol=1e-4, rtol=0):
+            raise ValueError(f"{row['case_id']}: seg geometry differs from image")
+        # Validate before conversion: rounding/casting can hide fractional or wrapped labels.
+        if not np.isin(values, [0, 1, 2, 3]).all():
+            raise ValueError(f"{row['case_id']}: segmentation must contain only integer labels 0..3")
+        seg = values.astype(np.uint8)
+    return np.stack(volumes, axis=0), affine, seg
+
+
+def lossless_bbox(mask: np.ndarray, seg: np.ndarray | None, margin: int,
+                  divisor: int) -> tuple[slice, slice, slice]:
+    """Keep the image-only crop unless it would discard an annotation."""
+    box = brain_bbox(mask, margin, divisor)
+    if seg is not None and np.count_nonzero(seg[box]) != np.count_nonzero(seg):
+        box = brain_bbox(mask | (seg > 0), margin, divisor)
+    return box
+
+
 def preprocess_case(
     row: dict, out_dir: str, margin: int, divisor: int, overwrite: bool = False
 ) -> dict:
@@ -204,41 +247,13 @@ def preprocess_case(
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     # ---- load and stack, asserting geometry agreement -------------------
-    volumes: list[np.ndarray] = []
-    affine = None
-    orig_shape = None
-    for suf in SEQUENCES:
-        img = nib.load(row[f"path_{suf}"])
-        arr = np.asanyarray(img.dataobj).astype(np.float32)
-        if affine is None:
-            affine = np.asarray(img.affine, dtype=np.float64)
-            orig_shape = arr.shape
-        elif arr.shape != orig_shape:
-            raise ValueError(f"{case_id}: {suf} shape {arr.shape} != {orig_shape}")
-        volumes.append(arr)
-    img4 = np.stack(volumes, axis=0)  # C, D, H, W in canonical SEQUENCES order
-    del volumes
-
-    # Brain mask = union of nonzero across sequences (data is skull-stripped).
+    img4, affine, seg = _load_source(row)
+    orig_shape = img4.shape[1:]
+    # Annotation support must not change MRI normalization or background codes.
     mask = np.any(img4 != 0, axis=0)
 
-    seg = None
-    seg_path = row.get("path_seg") or ""
-    if isinstance(seg_path, str) and seg_path:
-        seg_img = nib.load(seg_path)
-        if not np.allclose(np.asarray(seg_img.affine), affine, atol=1e-4):
-            raise ValueError(f"{case_id}: seg affine differs from image affine")
-        seg = np.rint(np.asanyarray(seg_img.dataobj)).astype(np.uint8)
-        if seg.shape != orig_shape:
-            raise ValueError(f"{case_id}: seg shape {seg.shape} != {orig_shape}")
-        # Cheap re-assertion of the label-3-not-4 invariant at cache time, so a
-        # bad file cannot reach training even if the manifest step was skipped.
-        vals = np.unique(seg)
-        if vals.max(initial=0) > 3:
-            raise ValueError(f"{case_id}: label value {int(vals.max())} > 3")
-
     # ---- crop ----------------------------------------------------------
-    box = brain_bbox(mask, margin=margin, divisor=divisor)
+    box = lossless_bbox(mask, seg, margin=margin, divisor=divisor)
     n_brain = int(mask.sum())
     n_fg = int((seg > 0).sum()) if seg is not None else 0
     img4 = crop_pad(img4, box)
@@ -304,67 +319,82 @@ def preprocess_case(
 # ---------------------------------------------------------------------------
 
 
-def verify_roundtrip(npz_path: Path, row: dict) -> dict:
-    """Check that a cached case reconstructs the original within quantization error."""
-    with np.load(npz_path) as z:
-        codes = z["img"]
-        stats = z["norm_stats"]
-        start = z["crop_start"]
-        stop = z["crop_stop"]
-        cached_seg = z["seg"] if "seg" in z.files else None
+def verify_roundtrip(npz_path: Path, row: dict, *, margin: int | None = None,
+                     divisor: int | None = None) -> dict:
+    """Verify cache geometry, normalization and voxelwise fidelity to raw NIfTI.
 
-    box = tuple(slice(int(a), int(b)) for a, b in zip(start, stop, strict=True))
-
-    # Recover the brain mask that `preprocess_case` actually used. It is the *union*
-    # of nonzero voxels across all four sequences, and `quantize` reserves code 0 for
-    # out-of-mask voxels while clamping in-mask codes to >= 1, so any channel recovers
-    # the mask exactly. Re-deriving it per channel here (`orig != 0`) would disagree on
-    # the handful of voxels that are nonzero in one sequence but zero in another, and
-    # would report a ~2 sigma error against a cache that is in fact correct.
+    Supplying margin/divisor also verifies the current crop policy before reuse.
+    Ground truth is inspected only for mechanical integrity, never model tuning.
+    """
+    with np.load(npz_path, allow_pickle=False) as cache:
+        codes = cache["img"]
+        stats = cache["norm_stats"]
+        start, stop, shape = (cache[key] for key in ("crop_start", "crop_stop", "orig_shape"))
+        cached_affine = cache["affine"]
+        cached_seg = cache["seg"] if "seg" in cache.files else None
+    source, affine, source_seg = _load_source(row)
+    if any(vector.shape != (3,) or vector.dtype.kind not in "iu" for vector in (start, stop, shape)):
+        raise ValueError("invalid cache geometry vectors")
+    if (not np.array_equal(shape, source.shape[1:]) or np.any(start < 0)
+            or np.any(start >= shape) or np.any(stop <= start)):
+        raise ValueError("cache geometry differs from source")
+    if (codes.dtype != np.uint8 or codes.shape != (len(SEQUENCES), *tuple(stop - start))
+            or stats.shape != (len(SEQUENCES), 2) or not np.isfinite(stats).all()
+            or np.any(stats[:, 1] <= 0)):
+        raise ValueError("invalid image codes or normalization statistics")
+    box = tuple(slice(int(low), int(high)) for low, high in zip(start, stop, strict=True))
+    full_mask = np.any(source != 0, axis=0)
+    expected_mask = crop_pad(full_mask, box)
     mask = codes[0] != QUANT_BACKGROUND_CODE
-    mask_consistent = all(
-        bool(((codes[c] != QUANT_BACKGROUND_CODE) == mask).all())
-        for c in range(1, codes.shape[0])
-    )
+    mask_consistent = all(np.array_equal(codes[index] != QUANT_BACKGROUND_CODE, mask)
+                          for index in range(len(SEQUENCES)))
+    crop_lossless = np.array_equal(expected_mask, mask) and np.count_nonzero(full_mask) == np.count_nonzero(mask)
+    geometry_ok = (cached_affine.shape == (4, 4) and np.isfinite(cached_affine).all()
+                   and np.allclose(cached_affine, affine, atol=1e-4, rtol=0))
+    policy_ok = True
+    if margin is not None or divisor is not None:
+        if margin is None or divisor is None:
+            raise ValueError("margin and divisor must be supplied together")
+        policy_ok = box == lossless_bbox(full_mask, source_seg, margin, divisor)
 
     worst_z = 0.0
-    full_mask: np.ndarray | None = None
-    for c, suf in enumerate(SEQUENCES):
-        orig_full = np.asanyarray(nib.load(row[f"path_{suf}"]).dataobj).astype(np.float32)
-        nz = orig_full != 0
-        full_mask = nz if full_mask is None else (full_mask | nz)
-        orig = crop_pad(orig_full, box)
-        mean, std = float(stats[c, 0]), float(stats[c, 1])
-        expect = np.clip((orig - mean) / std, -QUANT_CLIP_SIGMA, QUANT_CLIP_SIGMA)
-        expect = np.where(mask, expect, 0.0)
-        got = dequantize(codes[c])
-        worst_z = max(worst_z, float(np.abs(got - expect).max()))
+    norm_ok = True
+    for index in range(len(SEQUENCES)):
+        original = crop_pad(source[index], box)
+        foreground = original[expected_mask]
+        mean = float(foreground.mean()) if foreground.size else 0.0
+        std = float(foreground.std()) if foreground.size else 1.0
+        std = 1.0 if std < 1e-8 else std
+        norm_ok = norm_ok and np.allclose(stats[index], [mean, std], atol=1e-5, rtol=1e-6)
+        expected = np.where(expected_mask, np.clip((original - mean) / std,
+                                                  -QUANT_CLIP_SIGMA, QUANT_CLIP_SIGMA), 0.0)
+        worst_z = max(worst_z, float(np.abs(dequantize(codes[index]) - expected).max()))
 
-    # Comparing the cache with a crop of the source cannot reveal a crop that is too
-    # small, so also compare foreground counts against the *uncropped* source.
-    assert full_mask is not None
-    crop_lossless = int(full_mask.sum()) == int(mask.sum())
-
-    seg_ok = None
-    if cached_seg is not None and row.get("path_seg"):
-        orig_seg_full = np.rint(
-            np.asanyarray(nib.load(row["path_seg"]).dataobj)
-        ).astype(np.uint8)
-        orig_seg = crop_pad(orig_seg_full, box)
-        seg_ok = bool(
-            (orig_seg == cached_seg).all()
-            and int((orig_seg_full > 0).sum()) == int((cached_seg > 0).sum())
-        )
-
+    membership_ok = (source_seg is None) == (cached_seg is None)
+    seg_ok = None if source_seg is None and cached_seg is None else False
+    if source_seg is not None and cached_seg is not None:
+        seg_ok = (cached_seg.dtype == np.uint8 and np.array_equal(crop_pad(source_seg, box), cached_seg)
+                  and np.count_nonzero(source_seg) == np.count_nonzero(cached_seg))
     return {
         "case_id": row["case_id"],
         "max_abs_z_error": worst_z,
         "within_quant_step": worst_z <= quant_scale() * 0.51,
-        "mask_consistent": mask_consistent,
-        "crop_lossless": crop_lossless,
-        "seg_lossless": seg_ok,
+        "mask_consistent": bool(mask_consistent),
+        "crop_lossless": bool(crop_lossless),
+        "seg_lossless": None if seg_ok is None else bool(seg_ok),
+        "geometry_ok": bool(geometry_ok),
+        "normalization_ok": bool(norm_ok),
+        "crop_policy_matches": bool(policy_ok),
+        "label_membership_ok": membership_ok,
+        "label_voxels_outside_mri_mask": int(np.count_nonzero((source_seg > 0) & ~full_mask)) if source_seg is not None else 0,
         "mb": npz_path.stat().st_size / 1e6,
     }
+
+
+def roundtrip_passed(check: dict) -> bool:
+    return all(check[key] for key in ("within_quant_step", "mask_consistent", "crop_lossless",
+                                     "geometry_ok", "normalization_ok", "crop_policy_matches",
+                                     "label_membership_ok")) and check["seg_lossless"] is not False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -483,6 +513,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         if (vdf["seg_lossless"].dropna() == False).any():  # noqa: E712
             print("VERIFICATION FAILED: segmentation labels not preserved exactly")
+            return 1
+        if not all(roundtrip_passed(check) for check in checks):
+            print("VERIFICATION FAILED: geometry, normalization, or source membership mismatch")
             return 1
         print("Round-trip OK: intensities within half a step, labels lossless.")
 
