@@ -126,6 +126,47 @@ def test_stage_resume_into_clean_local_root_and_incompatibility_is_not_fallback(
     assert resolve_bundle(manager.run_root)["metadata"]["epoch"] == 1
 
 
+@pytest.mark.parametrize("stale_tail", [False, True])
+def test_resume_restores_cumulative_metrics_before_next_publication(tmp_path, monkeypatch, stale_tail):
+    from brats.artifacts import materialize_bundle
+
+    monkeypatch.delenv("BRATS_CKPT_ROOT", raising=False)
+    cfg = TrainConfig(execution_profile="spcs", run_id="history", attempt_id="first",
+                      artifact_root=str(tmp_path / "stage"))
+    model = TinyModel()
+    optimizer = torch.optim.AdamW(model.parameters())
+    first = CheckpointManager(cfg, root=tmp_path / "first")
+    identity = dict(dataset_identity="same-data", world_size=1, steps_per_epoch=1,
+                    model_config=asdict(model.cfg))
+    first.prepare_run(False, **identity)
+    for epoch in (0, 1):
+        first.save(epoch, model, optimizer, None, nn.Identity(), {"total": 0.5})
+    resumed = CheckpointManager(replace(cfg, attempt_id="second"), root=tmp_path / "fresh")
+    if stale_tail:
+        (resumed.dir / "metrics.jsonl").write_text('{"epoch": 99}\n')
+    resumed.prepare_run(True, **identity)
+    epoch = resumed.load_collective(model, optimizer, None, nn.Identity(), None, 0)
+    resumed.save(epoch, model, optimizer, None, nn.Identity(), {"total": 0.4})
+    files = materialize_bundle(resumed.run_root, resolve_bundle(resumed.run_root), tmp_path / "inspect")
+    assert [json.loads(line)["epoch"] for line in files["metrics.jsonl"].read_text().splitlines()] == [0, 1, 2]
+
+
+@pytest.mark.parametrize("precision", ["float32", "float16", "bfloat16"])
+def test_validation_honors_configured_precision(monkeypatch, precision):
+    import brats.inference as inference
+    from brats.train import validate
+
+    observed = []
+    def predict(model, image, *, cfg, device):
+        observed.append(cfg.amp_dtype)
+        return {"probs": np.ones((3, 2, 2, 2)), "cls_probs": np.array([1., 0., 0.])}
+    monkeypatch.setattr(inference, "predict_volume", predict)
+    batch = {"image": torch.ones(1, 4, 2, 2, 2), "label": torch.ones(1, 3, 2, 2, 2),
+             "cohort": torch.tensor([0])}
+    validate(nn.Identity(), [batch], torch.device("cpu"), TrainConfig(amp_dtype=precision))
+    assert observed == [getattr(torch, precision)]
+
+
 def test_scaler_state_and_rank_specific_rng(tmp_path, monkeypatch):
     monkeypatch.delenv("BRATS_CKPT_ROOT", raising=False)
     model = TinyModel()

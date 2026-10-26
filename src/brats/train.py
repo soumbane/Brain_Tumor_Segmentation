@@ -535,7 +535,13 @@ class CheckpointManager:
                 raise ValueError("resume checkpoint was not selected")
             def load_exact():
                 files = materialize_bundle(self.run_root, selected, self.dir / f"restore-rank-{rank}")
-                return self.load(model, optimizer, scheduler, loss_module, path=files["checkpoint.pt"], scaler=scaler, rank=rank)
+                epoch = self.load(model, optimizer, scheduler, loss_module, path=files["checkpoint.pt"], scaler=scaler, rank=rank)
+                if rank == 0:
+                    # Replace any unpublished local tail with the selected bundle's history.
+                    temporary = self.dir / "metrics.jsonl.restore.tmp"
+                    shutil.copyfile(files["metrics.jsonl"], temporary)
+                    temporary.replace(self.dir / "metrics.jsonl")
+                return epoch
             return collective_call(load_exact)
         selected = rank_zero_call(lambda: {"path": str(self.dir / "last.pt"), "sha256": sha256_file(self.dir / "last.pt")})
         def load_local():
@@ -764,7 +770,7 @@ def validate(
         sw_batch_size=cfg.val_sw_batch_size,
         overlap=0.5,
         tta_flip_axes=(),  # no TTA during training validation
-        amp_dtype=torch.bfloat16 if cfg.amp_dtype == "bfloat16" else torch.float16,
+        amp_dtype={"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[cfg.amp_dtype],
     )
 
     per_region: dict[str, list[float]] = {r: [] for r in REGIONS}
