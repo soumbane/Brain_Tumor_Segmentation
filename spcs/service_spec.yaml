@@ -1,10 +1,12 @@
-# TEMPLATE ONLY. Render concrete identities/deadline/image/SECRET after approval.
+# PREPARATION TEMPLATE: use spcs/prepare_job.py; do not submit placeholders.
+# Verified dataset/audit paths set; runtime IDs/deadline still required.
 # Target pool CARE_ML_RSRCH_GPU_M; one node, four independent A10G devices.
-# Fresh launch deliberately omits --resume. Resource fit requires GPU smoke.
+# Full training: 100 epochs, validation every 10. Smoke uses a separate rendered spec.
+# Fresh launch deliberately omits --resume. Rendering does not start a job.
 spec:
   containers:
     - name: train
-      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:REQUIRED_IMMUTABLE_TAG
+      image: /CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:spcs-20261026-runtime1
       command:
         - python
         - /app/spcs/supervise.py
@@ -32,20 +34,20 @@ spec:
         WANDB_DISABLE_CODE: "true"
         WANDB_DISABLE_GIT: "true"
         WANDB_SAVE_CODE: "false"
-        BRATS_CACHE_ROOT: "/mnt/data"
-        BRATS_SPLITS_CSV: "/mnt/data/splits/split_random_seed42.csv"
-        BRATS_MANIFEST_DIR: "/mnt/data/manifest"
+        BRATS_CACHE_ROOT: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/cache"
+        BRATS_SPLITS_CSV: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/splits/split_random_seed42.csv"
+        BRATS_MANIFEST_DIR: "/mnt/data/versions/cache-20261026-e0b7fe2fb085/manifest"
         BRATS_CKPT_ROOT: "/work"
         BRATS_ARTIFACT_ROOT: "/mnt/output/training"
         BRATS_RUN_ID: "REQUIRED_UNIQUE_RUN_ID"
         BRATS_ATTEMPT_ID: "REQUIRED_UNIQUE_ATTEMPT_ID"
-        BRATS_CACHE_AUDIT_PATH: "REQUIRED_VERIFIED_AUDIT_PATH"
-        BRATS_EXPECTED_SPLIT_SHA256: "REQUIRED_FROZEN_SPLIT_SHA256"
-        BRATS_WANDB_ENTITY: "REQUIRED_AUTHORIZED_ENTITY"
+        BRATS_CACHE_AUDIT_PATH: "/mnt/output/audits/cache-20261026-e0b7fe2fb085/cache-audit.json"
+        BRATS_EXPECTED_SPLIT_SHA256: "3e0efe90585fbb98be94f2035901d646a012a472090c8a9153344528df55f51e"
+        BRATS_WANDB_ENTITY: "banerjee-s-corewell"
         BRATS_MAX_RUNTIME_SECONDS: "REQUIRED_APPROVED_SECONDS"
       secrets:
         - snowflakeSecret:
-            objectName: CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.REQUIRED_WANDB_SECRET
+            objectName: CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.WANDB_API_KEY
           secretKeyRef: secret_string
           envVarName: WANDB_API_KEY
       resources:

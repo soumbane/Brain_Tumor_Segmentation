@@ -49,7 +49,9 @@ def test_stage_and_local_paths_are_separate():
     assert "WANDB_API_KEY" not in env
     secret = CONTAINER["secrets"][0]
     assert secret["envVarName"] == "WANDB_API_KEY" and secret["secretKeyRef"] == "secret_string"
-    assert "REQUIRED" in secret["snowflakeSecret"]["objectName"]
+    assert secret["snowflakeSecret"]["objectName"] == (
+        "CARE_ML_RESEARCH_WKSP.BRAIN_TUMOR_SEG.WANDB_API_KEY"
+    )
     assert "REQUIRED" in env["BRATS_MAX_RUNTIME_SECONDS"]
 
 
@@ -86,7 +88,11 @@ def test_build_separate_from_approved_push_and_no_latest():
     assert "--approve-image-push" in push
     assert "BRATS_REMOTE_TAG_ABSENCE_VERIFIED" in push
     assert ":latest" not in CONTAINER["image"]
-    assert "REQUIRED_IMMUTABLE_TAG" in CONTAINER["image"]
+    assert CONTAINER["image"] == (
+        "/CARE_ML_RESEARCH_WKSP/BRAIN_TUMOR_SEG/TRAINING_IMAGES/brats-train:spcs-20261026-runtime1"
+    )
+    assert CONTAINER["env"]["BRATS_WANDB_ENTITY"] == "banerjee-s-corewell"
+    assert "WANDB_BASE_URL" not in CONTAINER["env"]
 
 
 def test_inference_single_process_validation_only():
